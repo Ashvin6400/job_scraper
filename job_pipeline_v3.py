@@ -36,7 +36,7 @@ from apscheduler.triggers.cron import CronTrigger
 # ─────────────────────────────────────────────────────────
 # STEP 1 — APIFY (required)
 # ─────────────────────────────────────────────────────────
-APIFY_API_TOKEN = apify_api_eFuJZLHLfTUk38IS5A7OjWfcfsmck3256qEw
+APIFY_API_TOKEN = "apify_api_eFuJZLHLfTUk38IS5A7OjWfcfsmck3256qEw"
 
 # ─────────────────────────────────────────────────────────
 # STEP 2 — CHOOSE YOUR FREE NOTIFICATION METHODS
@@ -45,8 +45,8 @@ APIFY_API_TOKEN = apify_api_eFuJZLHLfTUk38IS5A7OjWfcfsmck3256qEw
 
 # ── Option A: Telegram (RECOMMENDED — instant phone push) ─
 USE_TELEGRAM       = True
-TELEGRAM_BOT_TOKEN = 8642509436:AAEoJDfs23Eao8xmw-GSRsr8otCxlb6Y5pY
-TELEGRAM_CHAT_ID   = 5817941574
+TELEGRAM_BOT_TOKEN = "8642509436:AAEoJDfs23Eao8xmw-GSRsr8otCxlb6Y5pY"
+TELEGRAM_CHAT_ID   = "5817941574"
 # Setup: @BotFather → /newbot → copy token
 # Get chat ID: https://api.telegram.org/bot<TOKEN>/getUpdates
 

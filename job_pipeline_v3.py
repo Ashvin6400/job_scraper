@@ -1,19 +1,7 @@
 """
 =============================================================
-ASHVIN'S JOB PIPELINE v4 — FIXED SCRAPER INPUTS
+ASHVIN'S JOB PIPELINE v5 — FIXED FILTERS + TELEGRAM
 =============================================================
-What was broken in v3:
-  ✗ Wrong input format for LinkedIn actor (used searchTerms — doesn't exist)
-  ✗ Wrong input format for Indeed actor (used position/country — wrong fields)
-  ✗ Used raw requests instead of apify-client (less reliable)
-
-What's fixed now:
-  ✓ LinkedIn: passes direct search URLs (correct format)
-  ✓ Indeed: passes direct search URLs (correct format)
-  ✓ Uses official apify-client library
-  ✓ Sends a Telegram test message on startup so you know it works
-  ✓ Better logging so you can see exactly what's happening
-
 pip install apify-client requests apscheduler
 =============================================================
 """
@@ -28,10 +16,6 @@ from apscheduler.triggers.cron import CronTrigger
 from apify_client import ApifyClient
 import requests
 
-# ─────────────────────────────────────────────
-# CONFIGURATION — from Railway environment vars
-# ─────────────────────────────────────────────
-
 APIFY_API_TOKEN    = os.environ.get("APIFY_API_TOKEN", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -40,105 +24,133 @@ ET                       = ZoneInfo("America/New_York")
 FRESHNESS_WINDOW_MINUTES = 120
 SEEN_JOB_HASHES: set     = set()
 
-# ─────────────────────────────────────────────
-# ACTOR IDs (correct ones)
-# ─────────────────────────────────────────────
-
-# LinkedIn — takes URLs like linkedin.com/jobs/search/?keywords=...
 LINKEDIN_ACTOR = "curious_coder/linkedin-jobs-scraper"
-
-# Indeed — takes URLs like indeed.com/jobs?q=...&l=...
 INDEED_ACTOR   = "misceres/indeed-scraper"
 
 # ─────────────────────────────────────────────
-# SEARCH URL BUILDERS
+# SEARCH URLS
 # ─────────────────────────────────────────────
 
-def build_linkedin_urls() -> list:
-    """Build LinkedIn job search URLs for each role."""
-    queries = [
-        "Data+Scientist",
-        "AI+Engineer",
-        "Machine+Learning+Engineer",
-        "Applied+Scientist",
-        "Senior+Data+Analyst",
-        "Analytics+Engineer",
-        "Quantitative+Analyst",
-        "Trade+Operations+Analyst",
+def build_linkedin_urls():
+    roles = [
+        '%22Data+Scientist%22',
+        '%22AI+Engineer%22',
+        '%22Machine+Learning+Engineer%22',
+        '%22Senior+Data+Analyst%22',
+        '%22Analytics+Engineer%22',
+        '%22Applied+Scientist%22',
+        '%22Quantitative+Analyst%22',
     ]
     urls = []
-    for q in queries:
-        # f_TPR=r86400 = posted in last 24 hours
-        # f_WT=2 = remote
+    for role in roles:
+        # f_TPR=r86400=last 24h, f_E=1,2=entry+associate, f_WT=2,3=remote+hybrid
         urls.append(
-            f"https://www.linkedin.com/jobs/search/?keywords={q}"
-            f"&location=United+States&f_TPR=r86400&f_WT=2&position=1&pageNum=0"
+            f"https://www.linkedin.com/jobs/search/?keywords={role}"
+            f"&location=United+States&f_TPR=r86400&f_E=1%2C2&f_WT=2%2C3"
         )
-        # Also non-remote (hybrid/onsite)
         urls.append(
-            f"https://www.linkedin.com/jobs/search/?keywords={q}"
-            f"&location=United+States&f_TPR=r86400&position=1&pageNum=0"
+            f"https://www.linkedin.com/jobs/search/?keywords={role}"
+            f"&location=United+States&f_TPR=r86400&f_E=1%2C2"
         )
     return urls
 
 
-def build_indeed_urls() -> list:
-    """Build Indeed job search URLs for each role."""
-    queries = [
-        ("data+scientist", "United+States"),
-        ("AI+engineer", "United+States"),
-        ("machine+learning+engineer", "United+States"),
-        ("senior+data+analyst", "United+States"),
-        ("quantitative+analyst", "United+States"),
-        ("trade+operations+analyst", "United+States"),
-        ("analytics+engineer", "United+States"),
-        ("applied+scientist", "United+States"),
+def build_indeed_urls():
+    searches = [
+        '%22data+scientist%22',
+        '%22AI+engineer%22',
+        '%22machine+learning+engineer%22',
+        '%22senior+data+analyst%22',
+        '%22analytics+engineer%22',
+        '%22applied+scientist%22',
+        '%22quantitative+analyst%22',
+        '%22trade+operations+analyst%22',
+        '%22data+scientist%22+entry+level',
+        '%22junior+data+scientist%22',
     ]
     urls = []
-    for q, loc in queries:
-        # fromage=1 = posted today, sort=date = newest first
+    for q in searches:
         urls.append(
-            f"https://www.indeed.com/jobs?q={q}&l={loc}&fromage=1&sort=date"
+            f"https://www.indeed.com/jobs?q={q}"
+            f"&l=United+States&fromage=1&sort=date"
         )
     return urls
 
 
 # ─────────────────────────────────────────────
-# SCRAPERS (using apify-client — official library)
+# FIELD NORMALIZER
+# Maps different actor field names → consistent dict
 # ─────────────────────────────────────────────
 
-def scrape_linkedin() -> list:
-    print("  [LinkedIn] Starting scrape...")
+def normalize(job):
+    return {
+        "title":       (job.get("title")
+                        or job.get("positionName")
+                        or job.get("jobTitle")
+                        or job.get("name")
+                        or "Unknown Role"),
+        "company":     (job.get("companyName")
+                        or job.get("company")
+                        or job.get("employer")
+                        or "Unknown Company"),
+        "location":    (job.get("location")
+                        or job.get("jobLocation")
+                        or "Unknown Location"),
+        "salary":      (job.get("salary")
+                        or job.get("salaryMin")
+                        or job.get("compensation")
+                        or job.get("salaryRange")
+                        or "Not listed"),
+        "url":         (job.get("jobUrl")
+                        or job.get("url")
+                        or job.get("externalUrl")
+                        or job.get("applyUrl")
+                        or "#"),
+        "description": (job.get("description")
+                        or job.get("jobDescription")
+                        or job.get("summary")
+                        or ""),
+        "posted_at":   (job.get("postedAt")
+                        or job.get("datePosted")
+                        or job.get("publishedAt")
+                        or job.get("date")
+                        or ""),
+        "_source":     job.get("_source", ""),
+    }
+
+
+# ─────────────────────────────────────────────
+# SCRAPERS
+# ─────────────────────────────────────────────
+
+def scrape_linkedin():
+    print("  [LinkedIn] Scraping...")
     try:
-        client   = ApifyClient(APIFY_API_TOKEN)
-        run_input = {
-            "urls": build_linkedin_urls()[:6],  # limit to 6 URLs per run to control cost
-            "count": 10,                         # jobs per URL
-        }
-        run    = client.actor(LINKEDIN_ACTOR).call(run_input=run_input)
-        items  = list(client.dataset(run["defaultDatasetId"]).iterate_items())
-        print(f"  [LinkedIn] Got {len(items)} raw jobs")
-        for j in items:
-            j["_source"] = "LinkedIn"
+        client = ApifyClient(APIFY_API_TOKEN)
+        run    = client.actor(LINKEDIN_ACTOR).call(run_input={
+            "urls":  build_linkedin_urls()[:8],
+            "count": 10,
+        })
+        items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+        for j in items: j["_source"] = "LinkedIn"
+        print(f"  [LinkedIn] {len(items)} raw")
         return items
     except Exception as e:
         print(f"  [LinkedIn ERROR] {e}")
         return []
 
 
-def scrape_indeed() -> list:
-    print("  [Indeed] Starting scrape...")
+def scrape_indeed():
+    print("  [Indeed] Scraping...")
     try:
-        client    = ApifyClient(APIFY_API_TOKEN)
-        run_input = {
-            "startUrls": [{"url": u} for u in build_indeed_urls()[:6]],
-            "maxItems":  50,
-        }
-        run   = client.actor(INDEED_ACTOR).call(run_input=run_input)
+        client = ApifyClient(APIFY_API_TOKEN)
+        run    = client.actor(INDEED_ACTOR).call(run_input={
+            "startUrls": [{"url": u} for u in build_indeed_urls()],
+            "maxItems":  100,
+        })
         items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
-        print(f"  [Indeed] Got {len(items)} raw jobs")
-        for j in items:
-            j["_source"] = "Indeed"
+        for j in items: j["_source"] = "Indeed"
+        print(f"  [Indeed] {len(items)} raw")
         return items
     except Exception as e:
         print(f"  [Indeed ERROR] {e}")
@@ -152,13 +164,23 @@ def scrape_indeed() -> list:
 DISQUALIFY_PHRASES = [
     "sponsorship not available", "we do not offer sponsorship",
     "no visa sponsorship", "unable to sponsor", "will not sponsor",
-    "cannot sponsor", "sponsorship is not", "not able to sponsor",
+    "cannot sponsor", "not able to sponsor",
     "must be a u.s. citizen", "must be a us citizen",
     "u.s. citizenship required", "us citizenship required",
     "active security clearance", "security clearance required",
-    "secret clearance", "top secret", "must hold a clearance",
-    "green card required", "gc required", "permanent resident required",
+    "secret clearance", "top secret",
+    "green card required", "gc required",
     "work authorization will not", "no h-1b", "no h1b",
+]
+
+# Titles that are clearly irrelevant
+BAD_TITLE_WORDS = [
+    "cashier", "sales representative", "busser", "waiter", "driver",
+    "warehouse", "nurse", "teacher", "mechanic", "electrician",
+    "customer service", "call center", "receptionist",
+    "firmware engineer", "hardware engineer", "production manager",
+    "marketing coordinator", "hr coordinator", "construction",
+    "t-mobile", "now hiring",
 ]
 
 SALARY_KEYWORDS = [
@@ -167,50 +189,46 @@ SALARY_KEYWORDS = [
 ]
 
 
-def job_hash(job: dict) -> str:
-    key = (
-        str(job.get("title","") or "").lower().strip() +
-        str(job.get("companyName", job.get("company","")) or "").lower().strip()
-    )
+def job_hash(job):
+    key = job["title"].lower().strip() + job["company"].lower().strip()
     return hashlib.md5(key.encode()).hexdigest()
 
 
-def is_fresh(job: dict) -> bool:
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=FRESHNESS_WINDOW_MINUTES)
-    for field in ["postedAt","datePosted","publishedAt","date","listingDate","jobPostedAt","scrapedAt"]:
-        raw = job.get(field)
-        if not raw:
-            continue
-        try:
-            posted = (
-                datetime.fromtimestamp(float(raw), tz=timezone.utc)
-                if isinstance(raw, (int, float))
-                else datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-            )
-            return posted >= cutoff
-        except Exception:
-            continue
-    return True  # no timestamp → include (don't miss real jobs)
+def is_fresh(job):
+    raw = job.get("posted_at", "")
+    if not raw:
+        return True
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=FRESHNESS_WINDOW_MINUTES)
+        posted = (
+            datetime.fromtimestamp(float(raw), tz=timezone.utc)
+            if isinstance(raw, (int, float))
+            else datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        )
+        return posted >= cutoff
+    except Exception:
+        return True
 
 
-def is_disqualified(job: dict) -> bool:
-    desc = (job.get("description","") or job.get("jobDescription","") or "").lower()
+def is_bad_title(job):
+    title = job["title"].lower()
+    return any(kw in title for kw in BAD_TITLE_WORDS)
+
+
+def is_disqualified(job):
+    desc = job["description"].lower()
     return any(p in desc for p in DISQUALIFY_PHRASES)
 
 
-def has_target_salary(job: dict) -> bool:
-    txt = " ".join([
-        str(job.get("salary","") or ""),
-        str(job.get("salaryMin","") or ""),
-        str(job.get("compensation","") or ""),
-    ]).lower()
-    if not txt.strip():
-        return True  # no salary listed → include, filter manually
+def has_target_salary(job):
+    txt = job["salary"].lower()
+    if not txt or txt == "not listed":
+        return True
     if any(kw.lower() in txt for kw in SALARY_KEYWORDS):
         return True
     for n in re.findall(r'\$?([\d,]+)', txt):
         try:
-            v = int(n.replace(",",""))
+            v = int(n.replace(",", ""))
             if v >= 120000 or 120 <= v <= 999:
                 return True
         except ValueError:
@@ -218,123 +236,145 @@ def has_target_salary(job: dict) -> bool:
     return False
 
 
-def score_job(job: dict) -> int:
+def score_job(job):
     score = 0
-    text  = " ".join([
-        str(job.get("title","") or ""),
-        str(job.get("description","") or ""),
-        str(job.get("jobDescription","") or ""),
-    ]).lower()
+    text  = (job["title"] + " " + job["description"]).lower()
 
     for skill, pts in {
-        "python":15, "sql":10, "machine learning":12, "power bi":8,
-        "data science":10, "azure":8, "llm":12, "rag":10,
-        "databricks":8, "tensorflow":8, "tableau":6, "pandas":5,
-        "statistical":8, "etl":6, "forecasting":7, "nlp":8,
+        "python": 15, "sql": 10, "machine learning": 12,
+        "power bi": 8, "data science": 10, "azure": 8,
+        "llm": 12, "rag": 10, "databricks": 8, "tensorflow": 8,
+        "tableau": 6, "pandas": 5, "statistical": 8,
+        "etl": 6, "forecasting": 7, "nlp": 8, "deep learning": 8,
+        "scikit": 7, "spark": 7, "snowflake": 6,
     }.items():
-        if skill in text:
-            score += pts
+        if skill in text: score += pts
 
-    for p in ["1-3 years","2+ years","entry level","junior","0-2 years","new grad","associate"]:
+    # Strong title match bonus
+    for t in ["data scientist", "ai engineer", "ml engineer",
+              "machine learning", "analytics engineer",
+              "applied scientist", "quantitative"]:
+        if t in job["title"].lower(): score += 15
+
+    for p in ["1-3 years","2+ years","entry level","junior",
+              "0-2 years","new grad","associate","early career"]:
         if p in text: score += 10
-    for p in ["3-5 years","senior","3+ years"]:
+
+    for p in ["3-5 years","3+ years","senior"]:
         if p in text: score += 3
-    for p in ["10+ years","8+ years","director","principal staff","vp of"]:
-        if p in text: score -= 15
-    for p in ["quant","trading","risk","portfolio","hedge fund","bloomberg","sharpe"]:
+
+    for p in ["10+ years","8+ years","7+ years","director",
+              "principal","vp of","head of","staff engineer"]:
+        if p in text: score -= 20
+
+    for p in ["quant","trading","risk","portfolio",
+              "hedge fund","bloomberg","sharpe","derivatives"]:
         if p in text: score += 8
 
     return min(100, max(0, score))
 
 
-def filter_jobs(raw: list) -> list:
+def filter_jobs(raw_jobs):
+    normalized = [normalize(j) for j in raw_jobs]
+    s_seen = s_title = s_fresh = s_disq = s_salary = 0
     passed = []
-    skipped_seen = skipped_stale = skipped_disq = skipped_salary = 0
 
-    for job in raw:
+    for job in normalized:
         h = job_hash(job)
-        if h in SEEN_JOB_HASHES:
-            skipped_seen += 1
-            continue
-        if not is_fresh(job):
-            skipped_stale += 1
-            continue
-        if is_disqualified(job):
-            skipped_disq += 1
-            continue
-        if not has_target_salary(job):
-            skipped_salary += 1
-            continue
-        job["relevance_score"] = score_job(job)
+        if h in SEEN_JOB_HASHES:       s_seen  += 1; continue
+        if is_bad_title(job):           s_title += 1; continue
+        if not is_fresh(job):           s_fresh += 1; continue
+        if is_disqualified(job):        s_disq  += 1; continue
+        if not has_target_salary(job):  s_salary+= 1; continue
+        job["score"] = score_job(job)
         SEEN_JOB_HASHES.add(h)
         passed.append(job)
 
-    print(f"  Filter breakdown → seen:{skipped_seen} stale:{skipped_stale} "
-          f"disqualified:{skipped_disq} salary:{skipped_salary} passed:{len(passed)}")
+    print(
+        f"  Filters: {len(normalized)} in | "
+        f"dupe:{s_seen} bad_title:{s_title} stale:{s_fresh} "
+        f"disq:{s_disq} salary:{s_salary} | {len(passed)} passed"
+    )
 
-    return sorted(passed, key=lambda j: j.get("relevance_score", 0), reverse=True)
+    # Sort by score, then dedupe by title+company
+    passed.sort(key=lambda j: j["score"], reverse=True)
+    seen_keys, deduped = set(), []
+    for job in passed:
+        key = job["title"].lower()[:30] + job["company"].lower()[:20]
+        if key not in seen_keys:
+            seen_keys.add(key)
+            deduped.append(job)
+
+    print(f"  After dedup: {len(deduped)} unique jobs")
+    return deduped
 
 
 # ─────────────────────────────────────────────
-# TELEGRAM
+# TELEGRAM — ALL JOBS SHOWN, NO "CHECK APIFY"
 # ─────────────────────────────────────────────
 
-def send_telegram(text: str) -> bool:
+def send_telegram(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("  [Telegram] Tokens not set — skipping")
-        return False
+        print("  [Telegram] Tokens missing"); return False
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            },
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
+                  "parse_mode": "HTML", "disable_web_page_preview": True},
             timeout=15,
         )
         if not r.ok:
-            print(f"  [Telegram ERROR] {r.status_code}: {r.text}")
+            print(f"  [Telegram ERROR] {r.status_code}: {r.text[:200]}")
             return False
         return True
     except Exception as e:
-        print(f"  [Telegram ERROR] {e}")
-        return False
+        print(f"  [Telegram ERROR] {e}"); return False
 
 
-def send_alerts(jobs: list, run_label: str):
+def score_label(score):
+    if score >= 70: return "🟢 HIGH"
+    if score >= 45: return "🟡 MED"
+    return "🔵 LOW"
+
+
+def send_all_jobs(jobs, run_label):
     if not jobs:
-        print("  No new matching jobs this run.")
+        send_telegram(
+            f"✅ <b>Pipeline ran — {run_label}</b>\n"
+            f"🕐 {datetime.now(ET).strftime('%a %b %d, %I:%M %p ET')}\n"
+            f"No new matching jobs this run."
+        )
         return
 
+    # Header
     send_telegram(
         f"🚨 <b>{len(jobs)} New Job(s) — {run_label}</b>\n"
         f"🕐 {datetime.now(ET).strftime('%a %b %d, %I:%M %p ET')}\n"
-        f"{'─' * 28}"
+        f"All {len(jobs)} match(es) below 👇"
     )
 
-    for job in jobs[:8]:
-        score   = job.get("relevance_score", 0)
-        icon    = "🟢" if score >= 70 else "🟡" if score >= 45 else "🔵"
-        title   = job.get("title","?")
-        company = job.get("companyName", job.get("company","?"))
-        loc     = job.get("location","?")
-        salary  = job.get("salary", job.get("compensation","Not listed"))
-        url     = job.get("jobUrl", job.get("url", job.get("externalUrl","#")))
-        source  = job.get("_source","")
+    # Send in batches of 5 (mobile-friendly)
+    for i in range(0, len(jobs), 5):
+        batch = jobs[i:i+5]
+        lines = []
+        for j, job in enumerate(batch, start=i+1):
+            sal = job["salary"] if job["salary"] != "Not listed" else "Salary not listed"
+            lines.append(
+                f"{j}. {score_label(job['score'])} — <b>{job['title']}</b>\n"
+                f"   🏢 {job['company']}  📍 {job['location']}\n"
+                f"   💰 {sal}  |  {job['_source']}\n"
+                f"   📊 Match: {job['score']}/100\n"
+                f"   🔗 <a href='{job['url']}'>Apply Now →</a>\n"
+            )
+        send_telegram("\n".join(lines))
 
-        send_telegram(
-            f"{icon} <b>{title}</b>\n"
-            f"🏢 {company}\n"
-            f"📍 {loc}\n"
-            f"💰 {salary}\n"
-            f"📊 Match: {score}/100  |  {source}\n"
-            f"🔗 <a href='{url}'>Apply Now →</a>"
-        )
-
-    if len(jobs) > 8:
-        send_telegram(f"⚠️ +{len(jobs) - 8} more — check Apify console.")
+    # Top 3 summary at the end
+    top3  = jobs[:3]
+    lines = ["⭐ <b>Top picks this run:</b>"]
+    for job in top3:
+        lines.append(f"• <a href='{job['url']}'>{job['title']} @ {job['company']}</a>")
+    lines.append("\n🎯 Apply within the hour for best results!")
+    send_telegram("\n".join(lines))
 
 
 # ─────────────────────────────────────────────
@@ -343,107 +383,80 @@ def send_alerts(jobs: list, run_label: str):
 
 def run_pipeline():
     now_et  = datetime.now(ET)
-    weekday = now_et.weekday()  # 0=Mon … 6=Sun
+    weekday = now_et.weekday()
     hour    = now_et.hour
 
     if weekday > 3 or hour < 7 or hour > 21:
-        print(f"[{now_et.strftime('%a %I:%M %p ET')}] Outside active window — skipping.")
-        return
+        print(f"[{now_et.strftime('%a %I:%M %p ET')}] Outside window."); return
 
     day_names = ["Monday","Tuesday","Wednesday","Thursday"]
     run_label = f"{day_names[weekday]} {now_et.strftime('%I:%M %p ET')}"
-    print(f"\n{'='*50}")
-    print(f"  Pipeline run: {run_label}")
-    print(f"{'='*50}")
+    print(f"\n{'='*52}\n  Run: {run_label}\n{'='*52}")
 
-    all_jobs = []
-    all_jobs.extend(scrape_linkedin())
-    all_jobs.extend(scrape_indeed())
-
-    print(f"\n  Total raw jobs: {len(all_jobs)}")
+    all_jobs = scrape_linkedin() + scrape_indeed()
+    print(f"  Total raw: {len(all_jobs)}")
 
     filtered = filter_jobs(all_jobs)
-    send_alerts(filtered, run_label)
-    print(f"  Run complete.\n")
+    send_all_jobs(filtered, run_label)
+    print(f"  Done — sent {len(filtered)} jobs\n")
 
 
 # ─────────────────────────────────────────────
-# STARTUP CHECKS
+# STARTUP
 # ─────────────────────────────────────────────
 
 def run_startup_checks():
     print("\n--- Startup checks ---")
-
-    # Check env vars
-    missing = []
-    if not APIFY_API_TOKEN:    missing.append("APIFY_API_TOKEN")
-    if not TELEGRAM_BOT_TOKEN: missing.append("TELEGRAM_BOT_TOKEN")
-    if not TELEGRAM_CHAT_ID:   missing.append("TELEGRAM_CHAT_ID")
+    missing = [k for k, v in {
+        "APIFY_API_TOKEN":    APIFY_API_TOKEN,
+        "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
+        "TELEGRAM_CHAT_ID":   TELEGRAM_CHAT_ID,
+    }.items() if not v]
 
     if missing:
-        print(f"  ❌ Missing environment variables: {', '.join(missing)}")
-        print("  → Go to Railway → Variables tab and add them")
-        return False
+        print(f"  Missing: {', '.join(missing)}"); return False
+    print("  All env vars set")
 
-    print("  ✅ All environment variables set")
-
-    # Test Telegram
-    print("  Testing Telegram...")
     ok = send_telegram(
-        "✅ <b>Ashvin Job Pipeline v4 is live!</b>\n"
-        "🕐 Running Mon/Wed/Thu every 3h, Tuesday every 2h\n"
-        "🔍 Searching: Data Scientist, AI Engineer, ML Engineer, "
-        "Senior Analyst, Quant, Trade Ops\n"
-        "📱 You'll get alerts like this when matching jobs are found."
+        "✅ <b>Job Pipeline v5 is live!</b>\n\n"
+        "Watching: Data Scientist · AI Engineer · ML Engineer\n"
+        "Senior Analyst · Analytics Engineer · Quant · Trade Ops\n\n"
+        "Mon/Wed/Thu: every 3h | Tuesday: every 2h\n"
+        "Filters: $120K+ · Sponsorship-friendly · Fresh jobs only\n"
+        "All matching jobs shown here — no more check Apify messages!"
     )
-    if ok:
-        print("  ✅ Telegram working — check your phone!")
-    else:
-        print("  ❌ Telegram failed — check BOT_TOKEN and CHAT_ID")
-        return False
-
+    if not ok:
+        print("  Telegram failed — check tokens"); return False
+    print("  Telegram working!")
     print("--- Checks passed ---\n")
     return True
 
 
-# ─────────────────────────────────────────────
-# SCHEDULER
-# ─────────────────────────────────────────────
-
 if __name__ == "__main__":
-    print("=" * 50)
-    print("  Ashvin Job Pipeline v4")
-    print("=" * 50)
-    print(f"  Time: {datetime.now(ET).strftime('%A %I:%M %p ET')}")
+    print("="*52)
+    print("  Ashvin Job Pipeline v5")
+    print(f"  {datetime.now(ET).strftime('%A %B %d, %I:%M %p ET')}")
+    print("="*52)
 
-    ok = run_startup_checks()
-    if not ok:
-        print("Fix the above errors then redeploy. Exiting.")
+    if not run_startup_checks():
         exit(1)
 
     scheduler = BlockingScheduler(timezone=ET)
-
-    # Mon / Wed / Thu — every 3 hours
     scheduler.add_job(run_pipeline, CronTrigger(
-        day_of_week="mon,wed,thu",
-        hour="7,10,13,16,19,21",
-        minute=0,
-        timezone=ET,
-    ), id="mwt", name="Mon/Wed/Thu 3hr")
-
-    # Tuesday — every 2 hours
+        day_of_week="mon,wed,thu", hour="7,10,13,16,19,21",
+        minute=0, timezone=ET), id="mwt")
     scheduler.add_job(run_pipeline, CronTrigger(
-        day_of_week="tue",
-        hour="7,9,11,13,15,17,19,21",
-        minute=0,
-        timezone=ET,
-    ), id="tue", name="Tuesday 2hr")
+        day_of_week="tue", hour="7,9,11,13,15,17,19,21",
+        minute=0, timezone=ET), id="tue")
 
-    print("  Schedule active:")
-    print("  ├─ Mon/Wed/Thu → 7am, 10am, 1pm, 4pm, 7pm, 9pm ET")
-    print("  ├─ Tuesday     → 7am, 9am, 11am, 1pm, 3pm, 5pm, 7pm, 9pm ET")
-    print("  └─ Fri–Sun     → OFF")
-    print("\n  Waiting for next scheduled run...\n")
+    print("  Mon/Wed/Thu → 7,10am,1,4,7,9pm ET")
+    print("  Tuesday     → 7,9,11am,1,3,5,7,9pm ET")
+    print("  Fri-Sun     → OFF\n")
+
+    now = datetime.now(ET)
+    if now.weekday() <= 3 and 7 <= now.hour <= 21:
+        print("  Running initial scan...\n")
+        run_pipeline()
 
     try:
         scheduler.start()

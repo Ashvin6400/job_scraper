@@ -1,1 +1,1 @@
-worker: python job_pipeline_v3.py
+worker: debug_scraper.py

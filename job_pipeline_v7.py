@@ -1,33 +1,34 @@
 """
 =============================================================
-ASHVIN'S JOB PIPELINE v7 — JSEARCH API (FREE, GOOGLE JOBS)
+ASHVIN'S JOB PIPELINE v8 — DIRECT LINKEDIN + JSEARCH
 =============================================================
-Uses JSearch by OpenWeb Ninja via RapidAPI (free tier).
-Pulls from Google for Jobs → covers LinkedIn, Indeed,
-Glassdoor, ZipRecruiter, company pages in one call.
+Scraping strategy:
+  1. LinkedIn public API (no key, no login, free, unlimited)
+     → linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search
+     → Returns 25 per page, paginate for more
+     → f_TPR=r3600 = posted in last 1 HOUR (not 24hrs)
+     → Real timestamps on every job
 
-Setup (2 min):
-  1. Go to rapidapi.com/letscrape-6bRBa3QguO5/api/jsearch
-  2. Sign up → subscribe to FREE plan (no credit card)
-  3. Copy your X-RapidAPI-Key from the API console
-  4. Add to Railway as: RAPIDAPI_KEY=your_key_here
+  2. JSearch (RapidAPI free tier, 200/month)
+     → Used as supplement only (5 queries on Tue, 3 other days)
+     → Covers Indeed/Glassdoor/ZipRecruiter that LinkedIn misses
 
-Free tier: 200 requests/month
-Our usage: 9 queries × ~6 runs/week = ~216/month
-Tip: Run Tuesday only at full 9 queries, other days 5 queries
-     to stay comfortably within 200/month free tier.
+This means every run gets genuinely fresh jobs posted in the
+last hour — not the last 24 hours.
 
-pip install requests apscheduler
+pip install requests apscheduler beautifulsoup4
 =============================================================
 """
 
 import os
 import re
+import time
 import hashlib
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
+from bs4 import BeautifulSoup
 import requests
 
 RAPIDAPI_KEY       = os.environ.get("RAPIDAPI_KEY", "")
@@ -35,17 +36,30 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 ET                   = ZoneInfo("America/New_York")
-MAX_APPLICANTS       = 100
 SEEN_JOB_HASHES: set = set()
 
-JSEARCH_URL = "https://jsearch.p.rapidapi.com/search"
+LINKEDIN_BASE = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+JSEARCH_URL   = "https://jsearch.p.rapidapi.com/search"
 JSEARCH_HEADERS = {
     "X-RapidAPI-Key":  RAPIDAPI_KEY,
     "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
 }
 
-# Tuesday: all 9 queries. Other days: top 5 to save API calls.
-SEARCH_QUERIES_FULL = [
+# LinkedIn headers to avoid bot detection
+LI_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# ─────────────────────────────────────────────
+# ROLES
+# ─────────────────────────────────────────────
+
+ROLES = [
     "Data Scientist",
     "AI Engineer",
     "Machine Learning Engineer",
@@ -54,131 +68,247 @@ SEARCH_QUERIES_FULL = [
     "Applied Scientist",
     "Quantitative Analyst",
     "Trade Operations Analyst",
-    "Junior Data Scientist",
 ]
-SEARCH_QUERIES_SHORT = SEARCH_QUERIES_FULL[:5]
+
+# JSearch supplement — fewer queries to save free tier
+JSEARCH_ROLES_TUESDAY = ["Data Scientist", "AI Engineer", "Machine Learning Engineer",
+                          "Analytics Engineer", "Quantitative Analyst"]
+JSEARCH_ROLES_OTHER   = ["Data Scientist", "AI Engineer", "Machine Learning Engineer"]
+
+# ─────────────────────────────────────────────
+# LINKEDIN SCRAPER — public API, no auth needed
+# ─────────────────────────────────────────────
+
+def scrape_linkedin_role(keyword: str, pages: int = 2) -> list:
+    """
+    Scrape LinkedIn public job search API.
+    pages=2 → 50 results per role (25 per page).
+    f_TPR=r3600 → posted in last 1 hour only.
+    f_E=1,2 → Entry + Associate level.
+    """
+    jobs = []
+    for page in range(pages):
+        try:
+            params = {
+                "keywords":  keyword,
+                "location":  "United States",
+                "f_TPR":     "r3600",   # last 1 HOUR — key change from r86400
+                "f_E":       "1,2",    # entry + associate
+                "f_JT":      "F",      # full time
+                "start":     page * 25,
+            }
+            resp = requests.get(
+                LINKEDIN_BASE,
+                headers=LI_HEADERS,
+                params=params,
+                timeout=15,
+            )
+            if resp.status_code == 429:
+                print(f"    LinkedIn rate limited — waiting 10s")
+                time.sleep(10)
+                continue
+            if not resp.ok:
+                print(f"    LinkedIn {keyword} p{page}: {resp.status_code}")
+                break
+
+            soup  = BeautifulSoup(resp.text, "html.parser")
+            cards = soup.find_all("div", class_="base-card")
+
+            if not cards:
+                break  # no more results
+
+            for card in cards:
+                try:
+                    # Extract fields from card HTML
+                    title_el   = card.find("h3", class_="base-search-card__title")
+                    company_el = card.find("h4", class_="base-search-card__subtitle")
+                    loc_el     = card.find("span", class_="job-search-card__location")
+                    time_el    = card.find("time")
+                    link_el    = card.find("a", class_="base-card__full-link")
+
+                    title   = title_el.get_text(strip=True)   if title_el   else ""
+                    company = company_el.get_text(strip=True) if company_el else ""
+                    loc     = loc_el.get_text(strip=True)     if loc_el     else ""
+                    url     = link_el["href"]                 if link_el    else "#"
+
+                    # Timestamp from <time datetime="2026-03-17T18:30:00.000Z">
+                    posted_utc = ""
+                    age_str    = ""
+                    if time_el:
+                        posted_utc = time_el.get("datetime", "")
+                        age_str    = time_el.get_text(strip=True)
+
+                    # Job ID for detail fetch
+                    entity_urn = card.get("data-entity-urn", "")
+                    job_id     = entity_urn.split(":")[-1] if entity_urn else ""
+
+                    jobs.append({
+                        "title":       title,
+                        "company":     company,
+                        "location":    loc,
+                        "salary":      "Not listed",  # not in card — detail fetch needed
+                        "url":         url,
+                        "description": "",            # fetched separately if needed
+                        "posted_utc":  posted_utc,
+                        "age_str":     age_str,
+                        "job_id":      job_id,
+                        "_source":     "LinkedIn",
+                    })
+                except Exception:
+                    continue
+
+            time.sleep(1)  # polite delay between pages
+
+        except Exception as e:
+            print(f"    LinkedIn '{keyword}' p{page} ERROR: {e}")
+            break
+
+    return jobs
+
+
+def scrape_linkedin() -> list:
+    print(f"  [LinkedIn] Scraping {len(ROLES)} roles (last 1 hour, 2 pages each)...")
+    all_jobs = []
+    for role in ROLES:
+        jobs = scrape_linkedin_role(role, pages=2)
+        print(f"    '{role}': {len(jobs)} results")
+        all_jobs.extend(jobs)
+        time.sleep(2)  # delay between roles to avoid rate limiting
+    print(f"  [LinkedIn] {len(all_jobs)} total raw")
+    return all_jobs
 
 
 # ─────────────────────────────────────────────
-# SCRAPER — JSearch API
+# JSEARCH SCRAPER — supplement for non-LinkedIn sources
 # ─────────────────────────────────────────────
 
 def scrape_jsearch(is_tuesday: bool) -> list:
-    queries   = SEARCH_QUERIES_FULL if is_tuesday else SEARCH_QUERIES_SHORT
-    all_jobs  = []
+    if not RAPIDAPI_KEY:
+        return []
 
-    print(f"  [JSearch] {len(queries)} queries, date_posted=today...")
+    roles    = JSEARCH_ROLES_TUESDAY if is_tuesday else JSEARCH_ROLES_OTHER
+    all_jobs = []
 
-    for query in queries:
+    print(f"  [JSearch] {len(roles)} queries (today only, supplement)...")
+    for query in roles:
         try:
             resp = requests.get(
                 JSEARCH_URL,
                 headers=JSEARCH_HEADERS,
                 params={
-                    "query":       f"{query} in United States",
-                    "page":        "1",
-                    "num_pages":   "1",
-                    "date_posted": "today",      # only today's jobs
-                    "remote_jobs_only": "false", # include all — filter later
+                    "query":            f"{query} in United States",
+                    "page":             "1",
+                    "num_pages":        "1",
+                    "date_posted":      "today",
                     "employment_types": "FULLTIME",
                 },
                 timeout=20,
             )
-
             if not resp.ok:
-                print(f"    '{query}' ERROR: {resp.status_code} {resp.text[:120]}")
+                print(f"    '{query}' ERROR: {resp.status_code}")
                 continue
-
-            data = resp.json()
-            jobs = data.get("data", [])
-
+            jobs = resp.json().get("data", [])
             for j in jobs:
                 j["_source"] = "Google Jobs"
-                j["_query"]  = query
-
             all_jobs.extend(jobs)
             print(f"    '{query}': {len(jobs)} results")
-
         except Exception as e:
             print(f"    '{query}' ERROR: {e}")
 
-    all_jobs = all_jobs[:60]
-    print(f"  [JSearch] {len(all_jobs)} total raw")
+    print(f"  [JSearch] {len(all_jobs)} total")
     return all_jobs
 
 
 # ─────────────────────────────────────────────
-# NORMALIZER — JSearch confirmed field names
-# job_title, employer_name, job_city, job_state,
-# job_min_salary, job_max_salary, job_salary_period,
-# job_apply_link, job_description,
-# job_posted_at_datetime_utc, job_posted_at_timestamp,
-# job_is_remote, job_required_experience
+# NORMALIZER — handles both LinkedIn and JSearch
 # ─────────────────────────────────────────────
 
 def normalize(job: dict) -> dict:
-    # Location
-    city  = job.get("job_city", "") or ""
-    state = job.get("job_state", "") or ""
-    if city and state:
-        location = f"{city}, {state}"
-    elif city or state:
-        location = city or state
+    source = job.get("_source", "")
+
+    if source == "LinkedIn":
+        return {
+            "title":       job.get("title", "Unknown Role"),
+            "company":     job.get("company", "Unknown Company"),
+            "location":    job.get("location", "Unknown Location"),
+            "salary":      "Not listed",
+            "url":         job.get("url", "#"),
+            "description": job.get("description", ""),
+            "posted_utc":  job.get("posted_utc", ""),
+            "age_str":     job.get("age_str", ""),
+            "posted_ts":   None,
+            "_source":     "LinkedIn",
+            "_via":        "LinkedIn",
+        }
     else:
-        location = "United States"
-    if job.get("job_is_remote"):
-        location = f"Remote ({location})" if location != "United States" else "Remote"
+        # JSearch fields
+        city  = job.get("job_city", "") or ""
+        state = job.get("job_state", "") or ""
+        loc   = f"{city}, {state}" if city and state else city or state or "United States"
+        if job.get("job_is_remote"): loc = f"Remote ({loc})" if loc else "Remote"
 
-    # Salary
-    s_min    = job.get("job_min_salary")
-    s_max    = job.get("job_max_salary")
-    s_period = (job.get("job_salary_period") or "year").lower()
-    if s_min and s_max:
-        salary = f"${int(s_min):,} – ${int(s_max):,} / {s_period}"
-    elif s_min:
-        salary = f"From ${int(s_min):,} / {s_period}"
-    else:
-        salary = "Not listed"
+        s_min    = job.get("job_min_salary")
+        s_max    = job.get("job_max_salary")
+        s_period = (job.get("job_salary_period") or "year").lower()
+        if s_min and s_max:
+            salary = f"${int(s_min):,} – ${int(s_max):,}/{s_period}"
+        elif s_min:
+            salary = f"From ${int(s_min):,}/{s_period}"
+        else:
+            salary = "Not listed"
 
-    # Timestamp — JSearch provides both UTC string and Unix timestamp
-    posted_utc = job.get("job_posted_at_datetime_utc", "")
-    posted_ts  = job.get("job_posted_at_timestamp")
+        posted_ts = job.get("job_posted_at_timestamp")
+        age_str   = ""
+        if posted_ts:
+            try:
+                delta = datetime.now(timezone.utc) - datetime.fromtimestamp(int(posted_ts), tz=timezone.utc)
+                hrs   = delta.total_seconds() / 3600
+                age_str = f"{int(delta.total_seconds()/60)}m ago" if hrs < 1 else f"{int(hrs)}h ago"
+            except Exception:
+                pass
 
-    # Age string
-    age_str = ""
-    if posted_ts:
+        return {
+            "title":       job.get("job_title", "Unknown Role"),
+            "company":     job.get("employer_name", "Unknown Company"),
+            "location":    loc,
+            "salary":      salary,
+            "url":         job.get("job_apply_link", job.get("job_google_link", "#")),
+            "description": job.get("job_description", "") or "",
+            "posted_utc":  job.get("job_posted_at_datetime_utc", ""),
+            "age_str":     age_str,
+            "posted_ts":   posted_ts,
+            "_source":     "Google Jobs",
+            "_via":        job.get("job_publisher", ""),
+        }
+
+
+# ─────────────────────────────────────────────
+# FRESHNESS — LinkedIn uses real datetime stamps
+# ─────────────────────────────────────────────
+
+def is_fresh(job: dict) -> bool:
+    # LinkedIn: posted_utc is ISO string like "2026-03-17T18:30:00.000Z"
+    utc = job.get("posted_utc", "")
+    if utc:
         try:
-            posted_dt = datetime.fromtimestamp(int(posted_ts), tz=timezone.utc)
-            delta     = datetime.now(timezone.utc) - posted_dt
-            hours     = delta.total_seconds() / 3600
-            if hours < 1:
-                age_str = f"{int(delta.total_seconds()/60)} min ago"
-            elif hours < 24:
-                age_str = f"{int(hours)}h ago"
-            else:
-                age_str = f"{int(hours/24)}d ago"
+            posted = datetime.fromisoformat(utc.replace("Z", "+00:00"))
+            delta  = datetime.now(timezone.utc) - posted
+            # LinkedIn already filtered by f_TPR=r3600 (1hr) on the API side
+            # but double-check here — keep jobs posted within last 4 hours
+            return delta.total_seconds() <= (4 * 3600)
         except Exception:
             pass
 
-    # Via (source platform)
-    via = job.get("job_publisher", "") or ""
+    # JSearch: unix timestamp
+    ts = job.get("posted_ts")
+    if ts:
+        try:
+            delta = datetime.now(timezone.utc) - datetime.fromtimestamp(int(ts), tz=timezone.utc)
+            return delta.total_seconds() <= (24 * 3600)  # JSearch is less precise
+        except Exception:
+            pass
 
-    return {
-        "title":           job.get("job_title", "Unknown Role"),
-        "company":         job.get("employer_name", "Unknown Company"),
-        "location":        location,
-        "salary":          salary,
-        "url":             job.get("job_apply_link", job.get("job_google_link", "#")),
-        "description":     job.get("job_description", ""),
-        "posted_utc":      posted_utc,
-        "posted_ts":       posted_ts,
-        "age_str":         age_str,
-        "via":             via,
-        "applicant_count": None,  # JSearch doesn't expose this
-        "_source":         f"Google Jobs",
-        "_via":            via,
-        "_query":          job.get("_query", ""),
-    }
+    return True  # unknown → include
 
 
 # ─────────────────────────────────────────────
@@ -186,23 +316,18 @@ def normalize(job: dict) -> dict:
 # ─────────────────────────────────────────────
 
 DISQUALIFY_PHRASES = [
-    "sponsorship not available", "we do not offer sponsorship",
-    "no visa sponsorship", "unable to sponsor", "will not sponsor",
-    "cannot sponsor", "not able to sponsor",
-    "must be a u.s. citizen", "must be a us citizen",
-    "u.s. citizenship required", "us citizenship required",
-    "active security clearance", "security clearance required",
-    "secret clearance", "top secret",
-    "green card required", "gc required",
-    "work authorization will not", "no h-1b", "no h1b",
+    "sponsorship not available","we do not offer sponsorship","no visa sponsorship",
+    "unable to sponsor","will not sponsor","cannot sponsor","not able to sponsor",
+    "must be a u.s. citizen","must be a us citizen","u.s. citizenship required",
+    "us citizenship required","active security clearance","security clearance required",
+    "secret clearance","top secret","green card required","gc required",
+    "work authorization will not","no h-1b","no h1b",
 ]
 
 BAD_TITLE_WORDS = [
-    "cashier","sales representative","busser","waiter","driver",
-    "warehouse","nurse","teacher","mechanic","electrician",
-    "customer service","call center","receptionist",
-    "firmware engineer","hardware engineer","production manager",
-    "marketing coordinator","construction","now hiring",
+    "cashier","sales representative","busser","waiter","driver","warehouse",
+    "nurse","teacher","mechanic","customer service","call center","receptionist",
+    "firmware engineer","hardware engineer","production manager","construction","now hiring",
 ]
 
 SALARY_KEYWORDS = [
@@ -212,30 +337,8 @@ SALARY_KEYWORDS = [
 
 
 def job_hash(job: dict) -> str:
-    key = job["title"].lower().strip() + job["company"].lower().strip()
+    key = (job["title"] or "").lower().strip() + (job["company"] or "").lower().strip()
     return hashlib.md5(key.encode()).hexdigest()
-
-
-def is_fresh(job: dict) -> bool:
-    ts = job.get("posted_ts")
-    if ts:
-        try:
-            posted = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-            delta  = datetime.now(timezone.utc) - posted
-            return delta.total_seconds() <= (24 * 3600)  # within last 24h
-        except Exception:
-            pass
-
-    utc = job.get("posted_utc", "")
-    if utc:
-        try:
-            posted = datetime.fromisoformat(utc.replace("Z", "+00:00"))
-            delta  = datetime.now(timezone.utc) - posted
-            return delta.total_seconds() <= (24 * 3600)
-        except Exception:
-            pass
-
-    return True  # no timestamp → include
 
 
 def is_bad_title(job: dict) -> bool:
@@ -248,49 +351,37 @@ def is_disqualified(job: dict) -> bool:
 
 def has_target_salary(job: dict) -> bool:
     txt = (job["salary"] or "").lower()
-    if not txt or txt == "not listed":
-        return True
-    if any(kw.lower() in txt for kw in SALARY_KEYWORDS):
-        return True
+    if not txt or txt == "not listed": return True
+    if any(kw.lower() in txt for kw in SALARY_KEYWORDS): return True
     for n in re.findall(r'\$?([\d,]+)', txt):
         try:
-            v = int(n.replace(",", ""))
-            if v >= 120000 or 120 <= v <= 999:
-                return True
-        except ValueError:
-            pass
+            v = int(n.replace(",",""))
+            if v >= 120000 or 120 <= v <= 999: return True
+        except ValueError: pass
     return False
 
 
 def score_job(job: dict) -> int:
     score = 0
     text  = ((job["title"] or "") + " " + (job["description"] or "")).lower()
-
     for skill, pts in {
-        "python":15,"sql":10,"machine learning":12,"power bi":8,
-        "data science":10,"azure":8,"llm":12,"rag":10,
-        "databricks":8,"tensorflow":8,"tableau":6,"pandas":5,
-        "statistical":8,"etl":6,"forecasting":7,"nlp":8,
+        "python":15,"sql":10,"machine learning":12,"power bi":8,"data science":10,
+        "azure":8,"llm":12,"rag":10,"databricks":8,"tensorflow":8,"tableau":6,
+        "pandas":5,"statistical":8,"etl":6,"forecasting":7,"nlp":8,
         "deep learning":8,"scikit":7,"spark":7,"snowflake":6,
     }.items():
         if skill in text: score += pts
-
     for t in ["data scientist","ai engineer","ml engineer","machine learning",
               "analytics engineer","applied scientist","quantitative"]:
-        if t in job["title"].lower(): score += 15
-
-    for p in ["1-3 years","2+ years","entry level","junior",
-              "0-2 years","new grad","associate","early career"]:
+        if t in (job["title"] or "").lower(): score += 15
+    for p in ["1-3 years","2+ years","entry level","junior","0-2 years","new grad","associate"]:
         if p in text: score += 10
     for p in ["3-5 years","3+ years","senior"]:
         if p in text: score += 3
-    for p in ["10+ years","8+ years","7+ years","director",
-              "principal","vp of","head of","staff engineer"]:
+    for p in ["10+ years","8+ years","director","principal","vp of","staff engineer"]:
         if p in text: score -= 20
-    for p in ["quant","trading","risk","portfolio",
-              "hedge fund","bloomberg","sharpe","derivatives"]:
+    for p in ["quant","trading","risk","portfolio","hedge fund","bloomberg","sharpe"]:
         if p in text: score += 8
-
     return min(100, max(0, score))
 
 
@@ -315,12 +406,11 @@ def filter_jobs(raw_jobs: list) -> list:
         f"dupe:{s_seen} bad_title:{s_title} stale:{s_fresh} "
         f"disq:{s_disq} salary:{s_sal} | {len(passed)} passed ✅"
     )
-
     passed.sort(key=lambda j: j["score"], reverse=True)
 
     seen_keys, deduped = set(), []
     for job in passed:
-        key = job["title"].lower()[:30] + job["company"].lower()[:20]
+        key = (job["title"] or "")[:30].lower() + (job["company"] or "")[:20].lower()
         if key not in seen_keys:
             seen_keys.add(key)
             deduped.append(job)
@@ -335,26 +425,20 @@ def filter_jobs(raw_jobs: list) -> list:
 
 def send_telegram(text: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("  [Telegram] Tokens missing"); return False
+        return False
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
                   "parse_mode": "HTML", "disable_web_page_preview": True},
-            timeout=15,
+            timeout=20,
         )
-        if not r.ok:
-            print(f"  [Telegram ERROR] {r.status_code}: {r.text[:200]}")
-            return False
-        return True
+        return r.ok
     except Exception as e:
         print(f"  [Telegram ERROR] {e}"); return False
 
 
-def score_label(score: int) -> str:
-    if score >= 70: return "🟢 HIGH"
-    if score >= 45: return "🟡 MED"
-    return "🔵 LOW"
+def score_label(s): return "🟢 HIGH" if s>=70 else "🟡 MED" if s>=45 else "🔵 LOW"
 
 
 def send_all_jobs(jobs: list, run_label: str):
@@ -362,38 +446,34 @@ def send_all_jobs(jobs: list, run_label: str):
         send_telegram(
             f"✅ <b>Pipeline ran — {run_label}</b>\n"
             f"🕐 {datetime.now(ET).strftime('%a %b %d, %I:%M %p ET')}\n"
-            f"No new matching jobs this run."
-        )
-        return
+            f"No new jobs posted in the last hour matching your profile."
+        ); return
 
     send_telegram(
         f"🚨 <b>{len(jobs)} Fresh Job(s) — {run_label}</b>\n"
         f"🕐 {datetime.now(ET).strftime('%a %b %d, %I:%M %p ET')}\n"
-        f"📡 Via Google Jobs (LinkedIn · Indeed · Glassdoor · ZipRecruiter)\n"
-        f"All {len(jobs)} match(es) below 👇"
+        f"⏱ Posted within last 1 hour (LinkedIn) / today (Google)\n"
+        f"All {len(jobs)} below 👇"
     )
-
     for i in range(0, len(jobs), 5):
-        batch = jobs[i:i+5]
         lines = []
-        for j, job in enumerate(batch, start=i+1):
+        for j, job in enumerate(jobs[i:i+5], start=i+1):
             sal = job["salary"] if job["salary"] != "Not listed" else "Salary not listed"
             age = f" · {job['age_str']}" if job.get("age_str") else ""
-            via = f" · {job['_via']}" if job.get("_via") else ""
+            via = f" · {job['_via']}" if job.get("_via") and job["_via"] != job["_source"] else ""
             lines.append(
                 f"{j}. {score_label(job['score'])} — <b>{job['title']}</b>\n"
                 f"   🏢 {job['company']}  📍 {job['location']}\n"
-                f"   💰 {sal}{age}{via}\n"
+                f"   💰 {sal}{age}  |  {job['_source']}{via}\n"
                 f"   📊 Match: {job['score']}/100\n"
                 f"   🔗 <a href='{job['url']}'>Apply Now →</a>\n"
             )
         send_telegram("\n".join(lines))
 
-    top3  = jobs[:3]
-    lines = ["⭐ <b>Top picks this run:</b>"]
-    for job in top3:
+    lines = ["⭐ <b>Top picks:</b>"]
+    for job in jobs[:3]:
         lines.append(f"• <a href='{job['url']}'>{job['title']} @ {job['company']}</a>")
-    lines.append("\n🎯 Apply within the hour — you're in the first wave!")
+    lines.append("\n🎯 Apply within the hour — first wave!")
     send_telegram("\n".join(lines))
 
 
@@ -415,10 +495,12 @@ def run_pipeline():
 
     print(f"\n{'='*52}\n  Run: {run_label}\n{'='*52}")
 
-    raw      = scrape_jsearch(is_tuesday)
+    raw = scrape_linkedin() + scrape_jsearch(is_tuesday)
+    print(f"  Total raw: {len(raw)}")
+
     filtered = filter_jobs(raw)
     send_all_jobs(filtered, run_label)
-    print(f"  Done — {len(filtered)} jobs sent to Telegram\n")
+    print(f"  Done — {len(filtered)} jobs sent\n")
 
 
 # ─────────────────────────────────────────────
@@ -428,25 +510,22 @@ def run_pipeline():
 def run_startup_checks() -> bool:
     print("\n--- Startup checks ---")
     missing = [k for k, v in {
-        "RAPIDAPI_KEY":       RAPIDAPI_KEY,
         "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
         "TELEGRAM_CHAT_ID":   TELEGRAM_CHAT_ID,
     }.items() if not v]
     if missing:
         print(f"  ❌ Missing: {', '.join(missing)}"); return False
+    if not RAPIDAPI_KEY:
+        print("  ⚠️  RAPIDAPI_KEY not set — JSearch supplement disabled, LinkedIn only")
     print("  ✅ All env vars set")
 
     ok = send_telegram(
-        "✅ <b>Job Pipeline v7 is live!</b>\n\n"
-        "📡 <b>Source: Google Jobs via JSearch (FREE)</b>\n"
-        "Covers: LinkedIn · Indeed · Glassdoor · ZipRecruiter · Company pages\n\n"
-        "🔍 <b>Roles:</b> Data Scientist · AI/ML Engineer\n"
-        "Senior Analyst · Analytics Engineer · Quant · Trade Ops\n\n"
-        "🎯 <b>Filters:</b>\n"
-        "• Posted today only\n"
-        "• $120K+ or salary not listed\n"
-        "• No sponsorship/clearance\n\n"
-        "📅 Mon/Wed/Thu: every 3h | Tuesday: every 2h (all queries)"
+        "✅ <b>Job Pipeline v8 is live!</b>\n\n"
+        "🔍 <b>Sources:</b>\n"
+        "• LinkedIn (direct scrape, last 1 HOUR)\n"
+        "• Google Jobs/JSearch (today, supplement)\n\n"
+        "🎯 <b>Filters:</b> $120K+ · No sponsorship · Fresh only\n\n"
+        "📅 Mon/Wed/Thu: every 3h | Tuesday: every 2h"
     )
     if not ok:
         print("  ❌ Telegram failed"); return False
@@ -461,12 +540,11 @@ def run_startup_checks() -> bool:
 
 if __name__ == "__main__":
     print("="*52)
-    print("  Ashvin Job Pipeline v7")
+    print("  Ashvin Job Pipeline v8")
     print(f"  {datetime.now(ET).strftime('%A %B %d, %I:%M %p ET')}")
     print("="*52)
 
-    if not run_startup_checks():
-        exit(1)
+    if not run_startup_checks(): exit(1)
 
     scheduler = BlockingScheduler(timezone=ET)
     scheduler.add_job(run_pipeline, CronTrigger(

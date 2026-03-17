@@ -1,17 +1,21 @@
 """
 =============================================================
-ASHVIN'S JOB PIPELINE v7 — GOOGLE JOBS VIA SERPER.DEV
+ASHVIN'S JOB PIPELINE v7 — JSEARCH API (FREE, GOOGLE JOBS)
 =============================================================
-No more Apify — replaced with Serper.dev free tier.
+Uses JSearch by OpenWeb Ninja via RapidAPI (free tier).
+Pulls from Google for Jobs → covers LinkedIn, Indeed,
+Glassdoor, ZipRecruiter, company pages in one call.
 
-Serper.dev free tier: 2,500 searches/month
-Our usage: ~9 queries × 6 runs/day Mon-Tue = ~700/month ✅
+Setup (2 min):
+  1. Go to rapidapi.com/letscrape-6bRBa3QguO5/api/jsearch
+  2. Sign up → subscribe to FREE plan (no credit card)
+  3. Copy your X-RapidAPI-Key from the API console
+  4. Add to Railway as: RAPIDAPI_KEY=your_key_here
 
-Coverage: Google Jobs aggregates LinkedIn, ZipRecruiter,
-Glassdoor, company career pages — broader than LinkedIn alone.
-(Note: Indeed is NOT included — Google and Indeed are competitors)
-
-Signup: serper.dev → free account → copy API key
+Free tier: 200 requests/month
+Our usage: 9 queries × ~6 runs/week = ~216/month
+Tip: Run Tuesday only at full 9 queries, other days 5 queries
+     to stay comfortably within 200/month free tier.
 
 pip install requests apscheduler
 =============================================================
@@ -20,14 +24,13 @@ pip install requests apscheduler
 import os
 import re
 import hashlib
-import json
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 import requests
 
-SERPER_API_KEY     = os.environ.get("SERPER_API_KEY", "")
+RAPIDAPI_KEY       = os.environ.get("RAPIDAPI_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
@@ -35,11 +38,14 @@ ET                   = ZoneInfo("America/New_York")
 MAX_APPLICANTS       = 100
 SEEN_JOB_HASHES: set = set()
 
-# ─────────────────────────────────────────────
-# TARGET ROLES
-# ─────────────────────────────────────────────
+JSEARCH_URL = "https://jsearch.p.rapidapi.com/search"
+JSEARCH_HEADERS = {
+    "X-RapidAPI-Key":  RAPIDAPI_KEY,
+    "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
+}
 
-SEARCH_QUERIES = [
+# Tuesday: all 9 queries. Other days: top 5 to save API calls.
+SEARCH_QUERIES_FULL = [
     "Data Scientist",
     "AI Engineer",
     "Machine Learning Engineer",
@@ -50,49 +56,45 @@ SEARCH_QUERIES = [
     "Trade Operations Analyst",
     "Junior Data Scientist",
 ]
+SEARCH_QUERIES_SHORT = SEARCH_QUERIES_FULL[:5]
+
 
 # ─────────────────────────────────────────────
-# GOOGLE JOBS SCRAPER via Serper.dev
-# Returns structured JSON — no HTML parsing needed
+# SCRAPER — JSearch API
 # ─────────────────────────────────────────────
 
-def scrape_google_jobs() -> list:
-    """
-    Serper.dev /google/jobs endpoint returns structured job listings
-    directly from Google Jobs — covers LinkedIn, ZipRecruiter,
-    Glassdoor, company career pages in one call.
-    """
-    print(f"  [Google Jobs] Scraping {len(SEARCH_QUERIES)} queries via Serper...")
-    all_jobs = []
+def scrape_jsearch(is_tuesday: bool) -> list:
+    queries   = SEARCH_QUERIES_FULL if is_tuesday else SEARCH_QUERIES_SHORT
+    all_jobs  = []
 
-    for query in SEARCH_QUERIES:
+    print(f"  [JSearch] {len(queries)} queries, date_posted=today...")
+
+    for query in queries:
         try:
-            response = requests.post(
-                "https://google.serper.dev/jobs",
-                headers={
-                    "X-API-KEY":    SERPER_API_KEY,
-                    "Content-Type": "application/json",
+            resp = requests.get(
+                JSEARCH_URL,
+                headers=JSEARCH_HEADERS,
+                params={
+                    "query":       f"{query} in United States",
+                    "page":        "1",
+                    "num_pages":   "1",
+                    "date_posted": "today",      # only today's jobs
+                    "remote_jobs_only": "false", # include all — filter later
+                    "employment_types": "FULLTIME",
                 },
-                json={
-                    "q":      query,
-                    "gl":     "us",          # country: US
-                    "hl":     "en",          # language: English
-                    "num":    10,            # results per query (max 10 on free)
-                    "tbs":    "qdr:d",       # posted in last 24 hours
-                },
-                timeout=15,
+                timeout=20,
             )
 
-            if not response.ok:
-                print(f"    '{query}' ERROR: {response.status_code} {response.text[:100]}")
+            if not resp.ok:
+                print(f"    '{query}' ERROR: {resp.status_code} {resp.text[:120]}")
                 continue
 
-            data = response.json()
-            jobs = data.get("jobs", [])
+            data = resp.json()
+            jobs = data.get("data", [])
 
             for j in jobs:
-                j["_source"]  = "Google Jobs"
-                j["_query"]   = query
+                j["_source"] = "Google Jobs"
+                j["_query"]  = query
 
             all_jobs.extend(jobs)
             print(f"    '{query}': {len(jobs)} results")
@@ -100,63 +102,81 @@ def scrape_google_jobs() -> list:
         except Exception as e:
             print(f"    '{query}' ERROR: {e}")
 
-    # Cap at 50 total
-    all_jobs = all_jobs[:50]
-    print(f"  [Google Jobs] {len(all_jobs)} total raw (capped at 50)")
+    all_jobs = all_jobs[:60]
+    print(f"  [JSearch] {len(all_jobs)} total raw")
     return all_jobs
 
 
 # ─────────────────────────────────────────────
-# NORMALIZER — Serper Google Jobs field names
-# Confirmed from Serper docs:
-#   jobTitle, companyName, location, salary,
-#   applyLink, description, date, via,
-#   extensions (list like ["2 hours ago", "Full-time", "Remote"])
+# NORMALIZER — JSearch confirmed field names
+# job_title, employer_name, job_city, job_state,
+# job_min_salary, job_max_salary, job_salary_period,
+# job_apply_link, job_description,
+# job_posted_at_datetime_utc, job_posted_at_timestamp,
+# job_is_remote, job_required_experience
 # ─────────────────────────────────────────────
 
 def normalize(job: dict) -> dict:
-    # Extensions array contains: posting age, job type, remote/hybrid, salary
-    extensions = job.get("extensions", []) or []
-    ext_text   = " | ".join(str(e) for e in extensions).lower()
+    # Location
+    city  = job.get("job_city", "") or ""
+    state = job.get("job_state", "") or ""
+    if city and state:
+        location = f"{city}, {state}"
+    elif city or state:
+        location = city or state
+    else:
+        location = "United States"
+    if job.get("job_is_remote"):
+        location = f"Remote ({location})" if location != "United States" else "Remote"
 
-    # Extract age from extensions e.g. "2 hours ago", "1 day ago"
-    age_str = ""
-    for ext in extensions:
-        e = str(ext).lower()
-        if "hour" in e or "minute" in e or "day" in e or "just" in e:
-            age_str = str(ext)
-            break
-
-    # Salary from extensions or dedicated field
-    salary = job.get("salary", "") or ""
-    if not salary:
-        for ext in extensions:
-            e = str(ext)
-            if "$" in e or "year" in e.lower() or "hour" in e.lower():
-                salary = e
-                break
-    if not salary:
+    # Salary
+    s_min    = job.get("job_min_salary")
+    s_max    = job.get("job_max_salary")
+    s_period = (job.get("job_salary_period") or "year").lower()
+    if s_min and s_max:
+        salary = f"${int(s_min):,} – ${int(s_max):,} / {s_period}"
+    elif s_min:
+        salary = f"From ${int(s_min):,} / {s_period}"
+    else:
         salary = "Not listed"
 
-    # Source platform (e.g. "via LinkedIn", "via ZipRecruiter")
-    via = job.get("via", "")
-    source_display = f"Google Jobs ({via})" if via else "Google Jobs"
+    # Timestamp — JSearch provides both UTC string and Unix timestamp
+    posted_utc = job.get("job_posted_at_datetime_utc", "")
+    posted_ts  = job.get("job_posted_at_timestamp")
+
+    # Age string
+    age_str = ""
+    if posted_ts:
+        try:
+            posted_dt = datetime.fromtimestamp(int(posted_ts), tz=timezone.utc)
+            delta     = datetime.now(timezone.utc) - posted_dt
+            hours     = delta.total_seconds() / 3600
+            if hours < 1:
+                age_str = f"{int(delta.total_seconds()/60)} min ago"
+            elif hours < 24:
+                age_str = f"{int(hours)}h ago"
+            else:
+                age_str = f"{int(hours/24)}d ago"
+        except Exception:
+            pass
+
+    # Via (source platform)
+    via = job.get("job_publisher", "") or ""
 
     return {
-        "title":           job.get("title",       job.get("jobTitle", "Unknown Role")),
-        "company":         job.get("companyName", job.get("company",  "Unknown Company")),
-        "location":        job.get("location",    "Unknown Location"),
+        "title":           job.get("job_title", "Unknown Role"),
+        "company":         job.get("employer_name", "Unknown Company"),
+        "location":        location,
         "salary":          salary,
-        "url":             job.get("applyLink",   job.get("link",     "#")),
-        "description":     job.get("description", ""),
-        "posted_at":       job.get("date",        ""),
+        "url":             job.get("job_apply_link", job.get("job_google_link", "#")),
+        "description":     job.get("job_description", ""),
+        "posted_utc":      posted_utc,
+        "posted_ts":       posted_ts,
         "age_str":         age_str,
-        "posted_today":    ("hour" in ext_text or "minute" in ext_text or
-                            "just" in ext_text or "today" in ext_text),
         "via":             via,
-        "extensions":      extensions,
-        "applicant_count": None,   # Google Jobs doesn't expose this
-        "_source":         source_display,
+        "applicant_count": None,  # JSearch doesn't expose this
+        "_source":         f"Google Jobs",
+        "_via":            via,
         "_query":          job.get("_query", ""),
     }
 
@@ -178,11 +198,11 @@ DISQUALIFY_PHRASES = [
 ]
 
 BAD_TITLE_WORDS = [
-    "cashier", "sales representative", "busser", "waiter", "driver",
-    "warehouse", "nurse", "teacher", "mechanic", "electrician",
-    "customer service", "call center", "receptionist",
-    "firmware engineer", "hardware engineer", "production manager",
-    "marketing coordinator", "construction", "now hiring",
+    "cashier","sales representative","busser","waiter","driver",
+    "warehouse","nurse","teacher","mechanic","electrician",
+    "customer service","call center","receptionist",
+    "firmware engineer","hardware engineer","production manager",
+    "marketing coordinator","construction","now hiring",
 ]
 
 SALARY_KEYWORDS = [
@@ -197,42 +217,25 @@ def job_hash(job: dict) -> str:
 
 
 def is_fresh(job: dict) -> bool:
-    """
-    Google Jobs via Serper returns:
-    - extensions like ["2 hours ago", "Full-time"]
-    - date field like "2 days ago" or "2026-03-17"
-    We use posted_today (from extensions) as primary signal.
-    """
-    if job.get("posted_today"):
-        return True
-
-    age = job.get("age_str", "").lower()
-    if age:
-        nums = re.findall(r'\d+', age)
-        n    = int(nums[0]) if nums else 99
-        if "minute" in age:              return True
-        if "hour"   in age and n <= 3:   return True
-        if "just"   in age:              return True
-        if "day"    in age:              return False
-
-    # Fallback: parse date field
-    date_str = job.get("posted_at", "")
-    if date_str:
+    ts = job.get("posted_ts")
+    if ts:
         try:
-            # "2 days ago" style
-            if "day" in date_str.lower():
-                nums = re.findall(r'\d+', date_str)
-                if nums and int(nums[0]) <= 1:
-                    return True
-                return False
-            # ISO date "2026-03-17"
-            posted = datetime.fromisoformat(date_str).date()
-            today  = datetime.now(ET).date()
-            return posted >= today - timedelta(days=1)
+            posted = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+            delta  = datetime.now(timezone.utc) - posted
+            return delta.total_seconds() <= (24 * 3600)  # within last 24h
         except Exception:
             pass
 
-    return True  # unknown → include
+    utc = job.get("posted_utc", "")
+    if utc:
+        try:
+            posted = datetime.fromisoformat(utc.replace("Z", "+00:00"))
+            delta  = datetime.now(timezone.utc) - posted
+            return delta.total_seconds() <= (24 * 3600)
+        except Exception:
+            pass
+
+    return True  # no timestamp → include
 
 
 def is_bad_title(job: dict) -> bool:
@@ -298,11 +301,11 @@ def filter_jobs(raw_jobs: list) -> list:
 
     for job in normalized:
         h = job_hash(job)
-        if h in SEEN_JOB_HASHES:          s_seen  += 1; continue
-        if is_bad_title(job):              s_title += 1; continue
-        if not is_fresh(job):              s_fresh += 1; continue
-        if is_disqualified(job):           s_disq  += 1; continue
-        if not has_target_salary(job):     s_sal   += 1; continue
+        if h in SEEN_JOB_HASHES:      s_seen  += 1; continue
+        if is_bad_title(job):          s_title += 1; continue
+        if not is_fresh(job):          s_fresh += 1; continue
+        if is_disqualified(job):       s_disq  += 1; continue
+        if not has_target_salary(job): s_sal   += 1; continue
         job["score"] = score_job(job)
         SEEN_JOB_HASHES.add(h)
         passed.append(job)
@@ -315,7 +318,6 @@ def filter_jobs(raw_jobs: list) -> list:
 
     passed.sort(key=lambda j: j["score"], reverse=True)
 
-    # Dedupe by title+company
     seen_keys, deduped = set(), []
     for job in passed:
         key = job["title"].lower()[:30] + job["company"].lower()[:20]
@@ -367,7 +369,7 @@ def send_all_jobs(jobs: list, run_label: str):
     send_telegram(
         f"🚨 <b>{len(jobs)} Fresh Job(s) — {run_label}</b>\n"
         f"🕐 {datetime.now(ET).strftime('%a %b %d, %I:%M %p ET')}\n"
-        f"📡 Source: Google Jobs (LinkedIn · ZipRecruiter · Glassdoor · Company pages)\n"
+        f"📡 Via Google Jobs (LinkedIn · Indeed · Glassdoor · ZipRecruiter)\n"
         f"All {len(jobs)} match(es) below 👇"
     )
 
@@ -375,9 +377,9 @@ def send_all_jobs(jobs: list, run_label: str):
         batch = jobs[i:i+5]
         lines = []
         for j, job in enumerate(batch, start=i+1):
-            sal  = job["salary"] if job["salary"] != "Not listed" else "Salary not listed"
-            age  = f" · {job['age_str']}" if job.get("age_str") else ""
-            via  = f" · via {job['via']}" if job.get("via") else ""
+            sal = job["salary"] if job["salary"] != "Not listed" else "Salary not listed"
+            age = f" · {job['age_str']}" if job.get("age_str") else ""
+            via = f" · {job['_via']}" if job.get("_via") else ""
             lines.append(
                 f"{j}. {score_label(job['score'])} — <b>{job['title']}</b>\n"
                 f"   🏢 {job['company']}  📍 {job['location']}\n"
@@ -407,11 +409,13 @@ def run_pipeline():
     if weekday > 3 or hour < 7 or hour > 21:
         print(f"[{now_et.strftime('%a %I:%M %p ET')}] Outside window."); return
 
-    day_names = ["Monday","Tuesday","Wednesday","Thursday"]
-    run_label = f"{day_names[weekday]} {now_et.strftime('%I:%M %p ET')}"
+    day_names  = ["Monday","Tuesday","Wednesday","Thursday"]
+    run_label  = f"{day_names[weekday]} {now_et.strftime('%I:%M %p ET')}"
+    is_tuesday = (weekday == 1)
+
     print(f"\n{'='*52}\n  Run: {run_label}\n{'='*52}")
 
-    raw      = scrape_google_jobs()
+    raw      = scrape_jsearch(is_tuesday)
     filtered = filter_jobs(raw)
     send_all_jobs(filtered, run_label)
     print(f"  Done — {len(filtered)} jobs sent to Telegram\n")
@@ -424,26 +428,25 @@ def run_pipeline():
 def run_startup_checks() -> bool:
     print("\n--- Startup checks ---")
     missing = [k for k, v in {
-        "SERPER_API_KEY":     SERPER_API_KEY,
+        "RAPIDAPI_KEY":       RAPIDAPI_KEY,
         "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
         "TELEGRAM_CHAT_ID":   TELEGRAM_CHAT_ID,
     }.items() if not v]
     if missing:
-        print(f"  ❌ Missing env vars: {', '.join(missing)}"); return False
+        print(f"  ❌ Missing: {', '.join(missing)}"); return False
     print("  ✅ All env vars set")
 
     ok = send_telegram(
         "✅ <b>Job Pipeline v7 is live!</b>\n\n"
-        "📡 <b>Source: Google Jobs (FREE)</b>\n"
-        "Covers: LinkedIn · ZipRecruiter · Glassdoor · Company pages\n\n"
-        "🔍 <b>Roles:</b> Data Scientist · AI Engineer · ML Engineer\n"
+        "📡 <b>Source: Google Jobs via JSearch (FREE)</b>\n"
+        "Covers: LinkedIn · Indeed · Glassdoor · ZipRecruiter · Company pages\n\n"
+        "🔍 <b>Roles:</b> Data Scientist · AI/ML Engineer\n"
         "Senior Analyst · Analytics Engineer · Quant · Trade Ops\n\n"
         "🎯 <b>Filters:</b>\n"
-        "• Posted today / last few hours only\n"
+        "• Posted today only\n"
         "• $120K+ or salary not listed\n"
-        "• No sponsorship/clearance requirements\n\n"
-        "📅 Mon/Wed/Thu: every 3h | Tuesday: every 2h\n"
-        "No Apify needed — runs on free Serper.dev tier!"
+        "• No sponsorship/clearance\n\n"
+        "📅 Mon/Wed/Thu: every 3h | Tuesday: every 2h (all queries)"
     )
     if not ok:
         print("  ❌ Telegram failed"); return False
@@ -473,8 +476,8 @@ if __name__ == "__main__":
         day_of_week="tue", hour="7,9,11,13,15,17,19,21",
         minute=0, timezone=ET), id="tue")
 
-    print("  Mon/Wed/Thu → 7,10am,1,4,7,9pm ET")
-    print("  Tuesday     → 7,9,11am,1,3,5,7,9pm ET")
+    print("  Mon/Wed/Thu → 7, 10am, 1, 4, 7, 9pm ET")
+    print("  Tuesday     → 7, 9, 11am, 1, 3, 5, 7, 9pm ET")
     print("  Fri-Sun     → OFF\n")
 
     now = datetime.now(ET)

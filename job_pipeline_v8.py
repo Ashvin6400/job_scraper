@@ -92,7 +92,7 @@ def scrape_linkedin_role(keyword: str, pages: int = 2) -> list:
             params = {
                 "keywords":  keyword,
                 "location":  "United States",
-                "f_TPR":     "r3600",   # last 1 HOUR — key change from r86400
+                "f_TPR":     "r11800",   # last 1 HOUR — key change from r86400
                 "f_E":       "1,2",    # entry + associate
                 "f_JT":      "F",      # full time
                 "start":     page * 25,

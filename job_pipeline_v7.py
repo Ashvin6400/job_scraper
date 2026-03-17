@@ -239,15 +239,15 @@ def is_fresh(job: dict) -> bool:
 
 
 def is_bad_title(job: dict) -> bool:
-    return any(kw in job["title"].lower() for kw in BAD_TITLE_WORDS)
+    return any(kw in (job["title"] or "").lower() for kw in BAD_TITLE_WORDS)
 
 
 def is_disqualified(job: dict) -> bool:
-    return any(p in job["description"].lower() for p in DISQUALIFY_PHRASES)
+    return any(p in (job["description"] or "").lower() for p in DISQUALIFY_PHRASES)
 
 
 def has_target_salary(job: dict) -> bool:
-    txt = job["salary"].lower()
+    txt = (job["salary"] or "").lower()
     if not txt or txt == "not listed":
         return True
     if any(kw.lower() in txt for kw in SALARY_KEYWORDS):
@@ -264,7 +264,7 @@ def has_target_salary(job: dict) -> bool:
 
 def score_job(job: dict) -> int:
     score = 0
-    text  = (job["title"] + " " + job["description"]).lower()
+    text  = ((job["title"] or "") + " " + (job["description"] or "")).lower()
 
     for skill, pts in {
         "python":15,"sql":10,"machine learning":12,"power bi":8,

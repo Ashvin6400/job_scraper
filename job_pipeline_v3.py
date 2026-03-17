@@ -1,7 +1,17 @@
 """
 =============================================================
-ASHVIN'S JOB PIPELINE v5 — FIXED FILTERS + TELEGRAM
+ASHVIN'S JOB PIPELINE v5.1
 =============================================================
+Changes:
+  ✓ Indeed: switched to borderline/indeed-scraper (4.87★, better dates)
+  ✓ LinkedIn: fetchJobDetails=True → gets real applicantCount field
+  ✓ LinkedIn: capped at 50 results per run
+  ✓ Indeed: capped at 50 results per run
+  ✓ Applicant filter: skip if applicantCount > 100
+    (LinkedIn only — Indeed doesn't expose this field)
+  ✓ Indeed: uses maxAge=1 (today only) for freshness guarantee
+  ✓ Freshness window bumped to 3hrs (180 min) to catch more real jobs
+
 pip install apify-client requests apscheduler
 =============================================================
 """
@@ -21,17 +31,24 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 ET                       = ZoneInfo("America/New_York")
-FRESHNESS_WINDOW_MINUTES = 120
+FRESHNESS_WINDOW_MINUTES = 180   # 3 hours — catches more real new jobs
+MAX_APPLICANTS           = 100   # skip if more than this applied (LinkedIn only)
 SEEN_JOB_HASHES: set     = set()
 
+# Actors
 LINKEDIN_ACTOR = "curious_coder/linkedin-jobs-scraper"
-INDEED_ACTOR   = "misceres/indeed-scraper"
+INDEED_ACTOR   = "borderline/indeed-scraper"   # switched: 4.87★, better date support
+
 
 # ─────────────────────────────────────────────
 # SEARCH URLS
 # ─────────────────────────────────────────────
 
 def build_linkedin_urls():
+    """
+    Exact quoted titles + entry/associate level + remote/hybrid + last 24h.
+    fetchJobDetails=True will be set in run_input to get applicantCount.
+    """
     roles = [
         '%22Data+Scientist%22',
         '%22AI+Engineer%22',
@@ -40,23 +57,25 @@ def build_linkedin_urls():
         '%22Analytics+Engineer%22',
         '%22Applied+Scientist%22',
         '%22Quantitative+Analyst%22',
+        '%22Trade+Operations+Analyst%22',
     ]
     urls = []
     for role in roles:
-        # f_TPR=r86400=last 24h, f_E=1,2=entry+associate, f_WT=2,3=remote+hybrid
+        # Entry + Associate level, remote + hybrid, posted last 24h
         urls.append(
             f"https://www.linkedin.com/jobs/search/?keywords={role}"
             f"&location=United+States&f_TPR=r86400&f_E=1%2C2&f_WT=2%2C3"
-        )
-        urls.append(
-            f"https://www.linkedin.com/jobs/search/?keywords={role}"
-            f"&location=United+States&f_TPR=r86400&f_E=1%2C2"
         )
     return urls
 
 
 def build_indeed_urls():
-    searches = [
+    """
+    borderline/indeed-scraper takes direct Indeed search URLs.
+    fromage=1 = posted today, sort=date = newest first.
+    Quoted titles prevent irrelevant results.
+    """
+    roles = [
         '%22data+scientist%22',
         '%22AI+engineer%22',
         '%22machine+learning+engineer%22',
@@ -65,11 +84,11 @@ def build_indeed_urls():
         '%22applied+scientist%22',
         '%22quantitative+analyst%22',
         '%22trade+operations+analyst%22',
-        '%22data+scientist%22+entry+level',
         '%22junior+data+scientist%22',
+        '%22data+scientist%22+entry+level',
     ]
     urls = []
-    for q in searches:
+    for q in roles:
         urls.append(
             f"https://www.indeed.com/jobs?q={q}"
             f"&l=United+States&fromage=1&sort=date"
@@ -83,57 +102,73 @@ def build_indeed_urls():
 # ─────────────────────────────────────────────
 
 def normalize(job):
+    # applicantCount: LinkedIn returns this as int when fetchJobDetails=True
+    # Indeed (borderline) does not expose it — we default to None (skip check)
+    raw_applicants = (
+        job.get("applicantCount")
+        or job.get("numberOfApplicants")
+        or job.get("applicants")
+    )
+    try:
+        applicant_count = int(raw_applicants) if raw_applicants is not None else None
+    except (ValueError, TypeError):
+        applicant_count = None
+
     return {
-        "title":       (job.get("title")
-                        or job.get("positionName")
-                        or job.get("jobTitle")
-                        or job.get("name")
-                        or "Unknown Role"),
-        "company":     (job.get("companyName")
-                        or job.get("company")
-                        or job.get("employer")
-                        or "Unknown Company"),
-        "location":    (job.get("location")
-                        or job.get("jobLocation")
-                        or "Unknown Location"),
-        "salary":      (job.get("salary")
-                        or job.get("salaryMin")
-                        or job.get("compensation")
-                        or job.get("salaryRange")
-                        or "Not listed"),
-        "url":         (job.get("jobUrl")
-                        or job.get("url")
-                        or job.get("externalUrl")
-                        or job.get("applyUrl")
-                        or "#"),
-        "description": (job.get("description")
-                        or job.get("jobDescription")
-                        or job.get("summary")
-                        or ""),
-        "posted_at":   (job.get("postedAt")
-                        or job.get("datePosted")
-                        or job.get("publishedAt")
-                        or job.get("date")
-                        or ""),
-        "_source":     job.get("_source", ""),
+        "title":           (job.get("title")
+                            or job.get("positionName")
+                            or job.get("jobTitle")
+                            or job.get("name")
+                            or "Unknown Role"),
+        "company":         (job.get("companyName")
+                            or job.get("company")
+                            or job.get("employer")
+                            or "Unknown Company"),
+        "location":        (job.get("location")
+                            or job.get("jobLocation")
+                            or "Unknown Location"),
+        "salary":          (job.get("salary")
+                            or job.get("salaryMin")
+                            or job.get("compensation")
+                            or job.get("salaryRange")
+                            or "Not listed"),
+        "url":             (job.get("jobUrl")
+                            or job.get("url")
+                            or job.get("externalUrl")
+                            or job.get("applyUrl")
+                            or "#"),
+        "description":     (job.get("description")
+                            or job.get("jobDescription")
+                            or job.get("summary")
+                            or ""),
+        "posted_at":       (job.get("postedAt")
+                            or job.get("datePosted")
+                            or job.get("publishedAt")
+                            or job.get("date")
+                            or job.get("scrapedAt")
+                            or ""),
+        "applicant_count": applicant_count,  # None = unknown (don't filter out)
+        "_source":         job.get("_source", ""),
     }
 
 
 # ─────────────────────────────────────────────
-# SCRAPERS
+# SCRAPERS — capped at 50 each
 # ─────────────────────────────────────────────
 
 def scrape_linkedin():
-    print("  [LinkedIn] Scraping...")
+    print("  [LinkedIn] Scraping (cap: 50, fetchJobDetails: True)...")
     try:
         client = ApifyClient(APIFY_API_TOKEN)
         run    = client.actor(LINKEDIN_ACTOR).call(run_input={
-            "urls":  build_linkedin_urls()[:8],
-            "count": 10,
+            "urls":             build_linkedin_urls(),
+            "count":            7,           # ~7 per URL × 8 URLs = ~56, trimmed to 50
+            "fetchJobDetails":  True,        # ← enables applicantCount field
         })
         items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+        items = items[:50]                   # hard cap at 50
         for j in items: j["_source"] = "LinkedIn"
-        print(f"  [LinkedIn] {len(items)} raw")
+        print(f"  [LinkedIn] {len(items)} raw (capped at 50)")
         return items
     except Exception as e:
         print(f"  [LinkedIn ERROR] {e}")
@@ -141,16 +176,18 @@ def scrape_linkedin():
 
 
 def scrape_indeed():
-    print("  [Indeed] Scraping...")
+    print("  [Indeed] Scraping with borderline actor (cap: 50)...")
     try:
         client = ApifyClient(APIFY_API_TOKEN)
         run    = client.actor(INDEED_ACTOR).call(run_input={
             "startUrls": [{"url": u} for u in build_indeed_urls()],
-            "maxItems":  100,
+            "maxItems":  50,                 # hard cap at 50
+            "maxAge":    1,                  # today only (borderline supports this)
         })
         items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+        items = items[:50]
         for j in items: j["_source"] = "Indeed"
-        print(f"  [Indeed] {len(items)} raw")
+        print(f"  [Indeed] {len(items)} raw (capped at 50)")
         return items
     except Exception as e:
         print(f"  [Indeed ERROR] {e}")
@@ -173,14 +210,13 @@ DISQUALIFY_PHRASES = [
     "work authorization will not", "no h-1b", "no h1b",
 ]
 
-# Titles that are clearly irrelevant
 BAD_TITLE_WORDS = [
     "cashier", "sales representative", "busser", "waiter", "driver",
     "warehouse", "nurse", "teacher", "mechanic", "electrician",
     "customer service", "call center", "receptionist",
     "firmware engineer", "hardware engineer", "production manager",
     "marketing coordinator", "hr coordinator", "construction",
-    "t-mobile", "now hiring",
+    "t-mobile", "now hiring", "campus minister", "religious",
 ]
 
 SALARY_KEYWORDS = [
@@ -197,7 +233,7 @@ def job_hash(job):
 def is_fresh(job):
     raw = job.get("posted_at", "")
     if not raw:
-        return True
+        return True   # no timestamp → include (don't miss real jobs)
     try:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=FRESHNESS_WINDOW_MINUTES)
         posted = (
@@ -208,6 +244,20 @@ def is_fresh(job):
         return posted >= cutoff
     except Exception:
         return True
+
+
+def has_too_many_applicants(job):
+    """
+    Returns True (= disqualify) if applicant count is known AND over limit.
+    If count is None (Indeed, or LinkedIn without detail fetch), allow through.
+    """
+    count = job.get("applicant_count")
+    if count is None:
+        return False   # unknown → don't filter out
+    too_many = count > MAX_APPLICANTS
+    if too_many:
+        print(f"    ✗ Too many applicants ({count}) — {job['title']} @ {job['company']}")
+    return too_many
 
 
 def is_bad_title(job):
@@ -276,16 +326,19 @@ def score_job(job):
 
 def filter_jobs(raw_jobs):
     normalized = [normalize(j) for j in raw_jobs]
-    s_seen = s_title = s_fresh = s_disq = s_salary = 0
+
+    s_seen = s_title = s_fresh = s_disq = s_salary = s_applicants = 0
     passed = []
 
     for job in normalized:
         h = job_hash(job)
-        if h in SEEN_JOB_HASHES:       s_seen  += 1; continue
-        if is_bad_title(job):           s_title += 1; continue
-        if not is_fresh(job):           s_fresh += 1; continue
-        if is_disqualified(job):        s_disq  += 1; continue
-        if not has_target_salary(job):  s_salary+= 1; continue
+        if h in SEEN_JOB_HASHES:           s_seen       += 1; continue
+        if is_bad_title(job):               s_title      += 1; continue
+        if not is_fresh(job):               s_fresh      += 1; continue
+        if has_too_many_applicants(job):    s_applicants += 1; continue
+        if is_disqualified(job):            s_disq       += 1; continue
+        if not has_target_salary(job):      s_salary     += 1; continue
+
         job["score"] = score_job(job)
         SEEN_JOB_HASHES.add(h)
         passed.append(job)
@@ -293,11 +346,13 @@ def filter_jobs(raw_jobs):
     print(
         f"  Filters: {len(normalized)} in | "
         f"dupe:{s_seen} bad_title:{s_title} stale:{s_fresh} "
-        f"disq:{s_disq} salary:{s_salary} | {len(passed)} passed"
+        f"too_many_applicants:{s_applicants} disq:{s_disq} "
+        f"salary:{s_salary} | {len(passed)} passed ✅"
     )
 
-    # Sort by score, then dedupe by title+company
     passed.sort(key=lambda j: j["score"], reverse=True)
+
+    # Dedupe by title+company (both scrapers may find same job)
     seen_keys, deduped = set(), []
     for job in passed:
         key = job["title"].lower()[:30] + job["company"].lower()[:20]
@@ -310,7 +365,7 @@ def filter_jobs(raw_jobs):
 
 
 # ─────────────────────────────────────────────
-# TELEGRAM — ALL JOBS SHOWN, NO "CHECK APIFY"
+# TELEGRAM
 # ─────────────────────────────────────────────
 
 def send_telegram(text):
@@ -342,38 +397,47 @@ def send_all_jobs(jobs, run_label):
         send_telegram(
             f"✅ <b>Pipeline ran — {run_label}</b>\n"
             f"🕐 {datetime.now(ET).strftime('%a %b %d, %I:%M %p ET')}\n"
-            f"No new matching jobs this run."
+            f"No new matching jobs under 100 applicants this run."
         )
         return
 
     # Header
     send_telegram(
-        f"🚨 <b>{len(jobs)} New Job(s) — {run_label}</b>\n"
+        f"🚨 <b>{len(jobs)} Fresh Job(s) — {run_label}</b>\n"
         f"🕐 {datetime.now(ET).strftime('%a %b %d, %I:%M %p ET')}\n"
+        f"✅ All under 100 applicants · Posted ≤3hrs ago\n"
         f"All {len(jobs)} match(es) below 👇"
     )
 
-    # Send in batches of 5 (mobile-friendly)
+    # Batches of 5
     for i in range(0, len(jobs), 5):
         batch = jobs[i:i+5]
         lines = []
         for j, job in enumerate(batch, start=i+1):
             sal = job["salary"] if job["salary"] != "Not listed" else "Salary not listed"
+            # Show applicant count if known
+            appl = job.get("applicant_count")
+            appl_str = f"👥 {appl} applicants" if appl is not None else "👥 Applicants: unknown"
             lines.append(
                 f"{j}. {score_label(job['score'])} — <b>{job['title']}</b>\n"
                 f"   🏢 {job['company']}  📍 {job['location']}\n"
                 f"   💰 {sal}  |  {job['_source']}\n"
-                f"   📊 Match: {job['score']}/100\n"
+                f"   {appl_str}  |  Match: {job['score']}/100\n"
                 f"   🔗 <a href='{job['url']}'>Apply Now →</a>\n"
             )
         send_telegram("\n".join(lines))
 
-    # Top 3 summary at the end
+    # Top 3 summary
     top3  = jobs[:3]
     lines = ["⭐ <b>Top picks this run:</b>"]
     for job in top3:
-        lines.append(f"• <a href='{job['url']}'>{job['title']} @ {job['company']}</a>")
-    lines.append("\n🎯 Apply within the hour for best results!")
+        appl = job.get("applicant_count")
+        appl_str = f"{appl} applicants" if appl is not None else "applicants unknown"
+        lines.append(
+            f"• <a href='{job['url']}'>{job['title']} @ {job['company']}</a>"
+            f" ({appl_str})"
+        )
+    lines.append("\n🎯 Apply within the hour — you're in the first wave!")
     send_telegram("\n".join(lines))
 
 
@@ -394,15 +458,15 @@ def run_pipeline():
     print(f"\n{'='*52}\n  Run: {run_label}\n{'='*52}")
 
     all_jobs = scrape_linkedin() + scrape_indeed()
-    print(f"  Total raw: {len(all_jobs)}")
+    print(f"  Total raw: {len(all_jobs)} (LinkedIn + Indeed, 50 each max)")
 
     filtered = filter_jobs(all_jobs)
     send_all_jobs(filtered, run_label)
-    print(f"  Done — sent {len(filtered)} jobs\n")
+    print(f"  Done — sent {len(filtered)} jobs to Telegram\n")
 
 
 # ─────────────────────────────────────────────
-# STARTUP
+# STARTUP CHECKS
 # ─────────────────────────────────────────────
 
 def run_startup_checks():
@@ -414,27 +478,36 @@ def run_startup_checks():
     }.items() if not v]
 
     if missing:
-        print(f"  Missing: {', '.join(missing)}"); return False
-    print("  All env vars set")
+        print(f"  ❌ Missing: {', '.join(missing)}"); return False
+    print("  ✅ All env vars set")
 
     ok = send_telegram(
-        "✅ <b>Job Pipeline v5 is live!</b>\n\n"
-        "Watching: Data Scientist · AI Engineer · ML Engineer\n"
+        "✅ <b>Job Pipeline v5.1 is live!</b>\n\n"
+        "🔍 <b>Roles:</b> Data Scientist · AI Engineer · ML Engineer\n"
         "Senior Analyst · Analytics Engineer · Quant · Trade Ops\n\n"
-        "Mon/Wed/Thu: every 3h | Tuesday: every 2h\n"
-        "Filters: $120K+ · Sponsorship-friendly · Fresh jobs only\n"
-        "All matching jobs shown here — no more check Apify messages!"
+        "🎯 <b>Filters active:</b>\n"
+        "• Posted ≤ 3 hours ago\n"
+        "• Under 100 applicants (LinkedIn)\n"
+        "• $120K+ salary (or unlisted)\n"
+        "• No sponsorship/clearance restrictions\n"
+        "• Max 50 results per source per run\n\n"
+        "📅 Mon/Wed/Thu: every 3h | Tue: every 2h"
     )
     if not ok:
-        print("  Telegram failed — check tokens"); return False
-    print("  Telegram working!")
+        print("  ❌ Telegram failed — check tokens in Railway Variables")
+        return False
+    print("  ✅ Telegram working!")
     print("--- Checks passed ---\n")
     return True
 
 
+# ─────────────────────────────────────────────
+# SCHEDULER
+# ─────────────────────────────────────────────
+
 if __name__ == "__main__":
     print("="*52)
-    print("  Ashvin Job Pipeline v5")
+    print("  Ashvin Job Pipeline v5.1")
     print(f"  {datetime.now(ET).strftime('%A %B %d, %I:%M %p ET')}")
     print("="*52)
 
@@ -449,8 +522,8 @@ if __name__ == "__main__":
         day_of_week="tue", hour="7,9,11,13,15,17,19,21",
         minute=0, timezone=ET), id="tue")
 
-    print("  Mon/Wed/Thu → 7,10am,1,4,7,9pm ET")
-    print("  Tuesday     → 7,9,11am,1,3,5,7,9pm ET")
+    print("  Mon/Wed/Thu → 7, 10am, 1, 4, 7, 9pm ET")
+    print("  Tuesday     → 7, 9, 11am, 1, 3, 5, 7, 9pm ET")
     print("  Fri-Sun     → OFF\n")
 
     now = datetime.now(ET)

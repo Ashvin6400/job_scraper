@@ -1,1 +1,1 @@
-worker: python job_pipeline_v8.py
+worker: python job_pipeline_v9.py

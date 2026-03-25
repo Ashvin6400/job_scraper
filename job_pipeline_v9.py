@@ -27,9 +27,10 @@ from apscheduler.triggers.cron import CronTrigger
 from bs4 import BeautifulSoup
 import requests
 
-RAPIDAPI_KEY       = os.environ.get("RAPIDAPI_KEY", "")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+RAPIDAPI_KEY        = os.environ.get("RAPIDAPI_KEY", "")
+TELEGRAM_BOT_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID_2  = os.environ.get("TELEGRAM_CHAT_ID_2", "")  # friend's chat ID — optional
 
 ET                   = ZoneInfo("America/New_York")
 SEEN_JOB_HASHES: set = set()
@@ -546,45 +547,381 @@ def has_target_salary(job: dict) -> bool:
     return min_sal >= 120000
 
 
-def score_job(job: dict) -> int:
+# ─────────────────────────────────────────────────────────────
+# ASHVIN'S PROFILE — used for multi-dimensional scoring
+# Update this if your skills/experience changes
+# ─────────────────────────────────────────────────────────────
+
+PROFILE = {
+    # Years of total experience
+    "years_exp": 2.5,
+
+    # Degrees held
+    "degrees": ["master", "m.s.", "ms", "bachelor", "b.tech"],
+
+    # Fields of study
+    "fields": ["computer science", "information science", "electronics",
+                "engineering", "data science", "statistics", "mathematics"],
+
+    # All skills — split into tiers for weighted scoring
+    "skills_strong": [
+        # Daily use tools from Mercedes-Benz role
+        "python", "sql", "power bi", "azure", "databricks",
+        "pandas", "numpy", "tableau", "etl", "statistical analysis",
+        "machine learning", "data science",
+    ],
+    "skills_working": [
+        # Used in projects, comfortable but not daily
+        "tensorflow", "pytorch", "nlp", "deep learning", "rag", "llm",
+        "scikit", "spark", "snowflake", "mlflow", "docker", "airflow",
+        "a/b test", "regression", "classification", "neural", "transformer",
+        "fine-tun", "embedding", "vector", "feature engineer",
+        "dbt", "looker", "bigquery", "redshift", "git",
+        "power automate", "rest api", "restful",
+    ],
+    "skills_aware": [
+        # Seen/heard of, can pick up quickly
+        "kubernetes", "terraform", "kafka", "flink", "java", "scala",
+        "r programming", "sas", "matlab", "c++",
+    ],
+
+    # Target role types and their fit score baselines
+    "target_roles": {
+        "data scientist":            85,
+        "ai engineer":               82,
+        "machine learning engineer": 82,
+        "ml engineer":               82,
+        "applied scientist":         78,
+        "senior data analyst":       78,
+        "analytics engineer":        75,
+        "quantitative analyst":      72,
+        "trade operations analyst":  68,
+        "data analyst":              60,
+        "research scientist":        65,
+        "decision scientist":        68,
+        "quantitative researcher":   72,
+        "junior data scientist":     80,
+        "data engineer":             50,
+        "business intelligence":     48,
+        "product analyst":           48,
+    },
+
+    # Industries that are good fits
+    "good_industries": [
+        "technology", "fintech", "finance", "banking", "insurance",
+        "healthcare", "automotive", "consulting", "saas", "startup",
+        "e-commerce", "retail", "media", "entertainment",
+    ],
+
+    # Industries to avoid (usually require clearance or citizenship)
+    "avoid_industries": [
+        "defense", "military", "government", "federal", "intelligence",
+        "aerospace", "contractor", "lockheed", "raytheon", "booz allen",
+        "leidos", "saic", "general dynamics", "northrop",
+    ],
+}
+
+# ─────────────────────────────────────────────────────────────
+# EXPERIENCE REQUIREMENT PARSER
+# Extracts required years from job description
+# ─────────────────────────────────────────────────────────────
+
+def parse_required_experience(text: str) -> tuple[int, int]:
+    """
+    Returns (min_years, max_years) required by the job.
+    Returns (0, 99) if not found.
+    Examples:
+      "2+ years" → (2, 99)
+      "3-5 years" → (3, 5)
+      "minimum 2 years" → (2, 99)
+      "at least 3 years" → (3, 99)
+      "1 to 3 years" → (1, 3)
+    """
+    text = text.lower()
+
+    # Pattern: "X-Y years" or "X to Y years"
+    range_match = re.search(
+        r'(\d+)\s*(?:-|to)\s*(\d+)\s*(?:\+\s*)?years?(?:\s+of)?(?:\s+experience)?',
+        text
+    )
+    if range_match:
+        return int(range_match.group(1)), int(range_match.group(2))
+
+    # Pattern: "X+ years" or "X or more years"
+    plus_match = re.search(
+        r'(\d+)\s*\+?\s*(?:or more\s+)?years?(?:\s+of)?(?:\s+experience)?',
+        text
+    )
+    if plus_match:
+        return int(plus_match.group(1)), 99
+
+    # Pattern: "minimum X" or "at least X"
+    min_match = re.search(
+        r'(?:minimum|at least|minimum of)\s+(\d+)\s*years?',
+        text
+    )
+    if min_match:
+        return int(min_match.group(1)), 99
+
+    return 0, 99  # not found
+
+
+def experience_fit_score(min_req: int, max_req: int) -> tuple[int, str]:
+    """
+    Returns (score_delta, reason) based on Ashvin's 2.5 years experience.
+    """
+    my_exp = PROFILE["years_exp"]
+
+    if min_req == 0:
+        return 0, ""  # no requirement stated
+
+    if my_exp < min_req:
+        gap = min_req - my_exp
+        if gap <= 0.5:
+            return -5, f"⚠️ Needs {min_req}yr (you have {my_exp}yr, close)"
+        elif gap <= 1.5:
+            return -15, f"⚠️ Needs {min_req}yr (you have {my_exp}yr, stretch)"
+        else:
+            return -30, f"❌ Needs {min_req}yr (you have {my_exp}yr, too senior)"
+    elif my_exp > max_req + 2 and max_req != 99:
+        return -10, f"⚠️ Max {max_req}yr exp wanted (overqualified)"
+    elif min_req <= my_exp <= min_req + 2:
+        return +15, f"✅ {min_req}yr required — perfect fit"
+    else:
+        return +8, f"✅ {min_req}yr required — good fit"
+
+
+# ─────────────────────────────────────────────────────────────
+# EDUCATION REQUIREMENT PARSER
+# ─────────────────────────────────────────────────────────────
+
+def education_fit_score(text: str) -> tuple[int, str]:
+    """
+    Checks if Ashvin's MS in CS meets the education requirement.
+    """
+    text = text.lower()
+
+    # PhD required — Ashvin doesn't have one
+    if re.search(r'phd|ph\.d|doctorate', text):
+        # Check if it says "preferred" vs "required"
+        phd_ctx = text[max(0, text.find("ph")-30):text.find("ph")+50]
+        if any(w in phd_ctx for w in ["preferred", "nice to have", "plus", "or equivalent"]):
+            return -5, "⚠️ PhD preferred (you have MS)"
+        return -20, "❌ PhD required (you have MS)"
+
+    # Master's required or preferred — Ashvin has MS in CS ✅
+    if re.search(r"master'?s?|m\.s|m\.eng|graduate degree", text):
+        return +10, "✅ Master's required — you qualify"
+
+    # Bachelor's only
+    if re.search(r"bachelor'?s?|b\.s|b\.tech|undergraduate", text):
+        return +5, "✅ Bachelor's required — you qualify"
+
+    return 0, ""
+
+
+# ─────────────────────────────────────────────────────────────
+# SKILLS REQUIREMENT PARSER
+# Identifies which skills the job requires vs which you have
+# ─────────────────────────────────────────────────────────────
+
+def skills_fit_score(text: str) -> tuple[int, str, list, list]:
+    """
+    Returns (score, summary, matched_skills, missing_skills)
+    Differentiates between strong skills (high points) and
+    working skills (medium points).
+    """
+    text_lower = text.lower()
+
+    matched_strong  = []
+    matched_working = []
+    missing_must    = []
+
+    # Check strong skills
+    for skill in PROFILE["skills_strong"]:
+        if skill in text_lower:
+            matched_strong.append(skill)
+
+    # Check working skills
+    for skill in PROFILE["skills_working"]:
+        if skill in text_lower:
+            matched_working.append(skill)
+
+    # Detect "required" vs "preferred" skills in description
+    # Look for patterns like "Python required", "must have SQL"
+    must_have_skills = []
+    must_patterns = re.findall(
+        r'(?:required|must have|must know|mandatory|essential)[:\s]+([^\.\n,]{5,60})',
+        text_lower
+    )
+    for chunk in must_patterns:
+        for skill in PROFILE["skills_strong"] + PROFILE["skills_working"]:
+            if skill in chunk:
+                must_have_skills.append(skill)
+
+    # Score calculation
+    strong_score  = len(matched_strong)  * 8   # 8pts per strong skill match
+    working_score = len(matched_working) * 4   # 4pts per working skill match
+    skill_score   = min(strong_score + working_score, 40)
+
+    # Build missing list for must-have skills
+    all_matched = set(matched_strong + matched_working)
+    missing_must = [s for s in must_have_skills if s not in all_matched]
+
+    # Summary
+    total_matched = len(matched_strong) + len(matched_working)
+    summary = f"{len(matched_strong)} core + {len(matched_working)} working skills matched"
+
+    return skill_score, summary, matched_strong + matched_working, missing_must
+
+
+# ─────────────────────────────────────────────────────────────
+# COMPANY / INDUSTRY FIT
+# ─────────────────────────────────────────────────────────────
+
+def company_fit_score(title: str, company: str, description: str) -> tuple[int, str]:
+    combined = (title + " " + company + " " + description).lower()
+
+    # Avoid industries (defense etc.) — extra signal beyond disqualify phrases
+    for ind in PROFILE["avoid_industries"]:
+        if ind in combined:
+            return -20, f"⚠️ Avoid: {ind} industry"
+
+    # Good industries
+    for ind in PROFILE["good_industries"]:
+        if ind in combined:
+            return +5, f"✅ Good industry: {ind}"
+
+    return 0, ""
+
+
+# ─────────────────────────────────────────────────────────────
+# MASTER SCORING FUNCTION
+# Returns score + detailed breakdown for Telegram message
+# ─────────────────────────────────────────────────────────────
+
+def score_job(job: dict) -> tuple[int, dict]:
+    """
+    Returns (total_score, breakdown_dict)
+    breakdown contains human-readable reasons per dimension.
+    """
+    title       = (job.get("title", "") or "").lower()
+    description = (job.get("description", "") or "")
+    company     = (job.get("company", "") or "")
+    keyword     = (job.get("_keyword", "") or "").lower()
+    has_desc    = len(description) > 150
+
+    breakdown = {}
     score = 0
-    text  = (job["title"] + " " + job["description"]).lower()
 
-    for skill, pts in {
-        "python":15, "sql":10, "machine learning":12, "power bi":8,
-        "data science":10, "azure":8, "llm":12, "rag":10,
-        "databricks":8, "tensorflow":8, "tableau":6, "pandas":5,
-        "statistical":8, "etl":6, "forecasting":7, "nlp":8,
-        "deep learning":8, "scikit":7, "spark":7, "snowflake":6,
-        "pytorch":8, "mlflow":6, "docker":5, "airflow":6,
-    }.items():
-        if skill in text: score += pts
+    # ── Dimension 1: Role fit (title match) ──
+    role_score = 0
+    role_label = ""
+    for role, base in PROFILE["target_roles"].items():
+        if role in title:
+            role_score = base
+            role_label = f"✅ '{role.title()}' is a target role"
+            break
+    if not role_score:
+        # Partial match
+        if any(w in title for w in ["scientist", "analyst"]):
+            role_score, role_label = 45, "🟡 Analyst/Scientist role"
+        elif any(w in title for w in ["engineer", "developer"]):
+            role_score, role_label = 35, "🟡 Engineering role"
+        else:
+            role_score, role_label = 20, "🔵 Unknown role type"
+    breakdown["role"] = (role_score, role_label)
+    score = role_score
 
-    # Title match bonus
-    for t in ["data scientist", "ai engineer", "ml engineer", "machine learning",
-              "analytics engineer", "applied scientist", "quantitative"]:
-        if t in job["title"].lower(): score += 15
+    # ── Dimension 2: Experience requirement ──
+    if has_desc:
+        min_exp, max_exp = parse_required_experience(description)
+        exp_delta, exp_label = experience_fit_score(min_exp, max_exp)
+        if exp_label:
+            breakdown["experience"] = (exp_delta, exp_label)
+            score += exp_delta
+    else:
+        # No description — use keyword as proxy
+        # If we searched "junior" or "entry" in the role, give slight boost
+        if any(w in keyword for w in ["junior", "entry", "associate"]):
+            breakdown["experience"] = (+8, "✅ Entry/junior role searched")
+            score += 8
 
-    # Experience level
-    for p in ["1-3 years","2+ years","entry level","junior",
-              "0-2 years","new grad","associate","early career"]:
-        if p in text: score += 10
-    for p in ["3-5 years","3+ years"]:
-        if p in text: score += 3
-    for p in ["10+ years","8+ years","7+ years","director",
-              "principal","vp of","head of","staff engineer"]:
-        if p in text: score -= 20
+    # ── Dimension 3: Education fit ──
+    if has_desc:
+        edu_delta, edu_label = education_fit_score(description)
+        if edu_label:
+            breakdown["education"] = (edu_delta, edu_label)
+            score += edu_delta
 
-    # Finance/quant bonus (algo trading background)
-    for p in ["quant","trading","risk","portfolio","hedge fund",
-              "bloomberg","sharpe","derivatives","options","futures"]:
-        if p in text: score += 8
+    # ── Dimension 4: Skills match ──
+    if has_desc:
+        skill_delta, skill_summary, matched, missing = skills_fit_score(description)
+        breakdown["skills"] = (skill_delta, skill_summary)
+        if missing:
+            breakdown["missing_skills"] = (0, f"⚠️ Must-have gaps: {', '.join(missing[:3])}")
+        score += skill_delta
+    else:
+        # No description — give base points for being in target category
+        if any(role in title for role in list(PROFILE["target_roles"].keys())[:8]):
+            breakdown["skills"] = (+10, "🟡 Skills assumed relevant (no description)")
+            score += 10
 
-    # Salary bonus — reward jobs that explicitly show $120K+
-    if parse_salary_min(job["salary"]) >= 120000:
-        score += 10
+    # ── Dimension 5: Seniority signals in title ──
+    seniority_delta = 0
+    seniority_label = ""
+    if any(w in title for w in ["director", "vp ", "vice president",
+                                  "principal", "staff ", "head of", "chief", "lead"]):
+        seniority_delta, seniority_label = -20, "❌ Too senior (Director/VP/Principal)"
+    elif any(w in title for w in ["senior", "sr."]):
+        seniority_delta, seniority_label = -5, "⚠️ Senior title (stretch for 2.5yr exp)"
+    elif any(w in title for w in ["junior", "jr.", "entry", "associate", "i ", "ii "]):
+        seniority_delta, seniority_label = +10, "✅ Entry/junior level"
+    elif "senior" not in title and not seniority_label:
+        seniority_delta, seniority_label = +5, "✅ Mid-level (good fit)"
+    if seniority_label:
+        breakdown["seniority"] = (seniority_delta, seniority_label)
+        score += seniority_delta
 
-    return min(100, max(0, score))
+    # ── Dimension 6: Industry/company fit ──
+    ind_delta, ind_label = company_fit_score(title, company, description if has_desc else "")
+    if ind_label:
+        breakdown["industry"] = (ind_delta, ind_label)
+        score += ind_delta
+
+    # ── Dimension 7: Finance/quant bonus ──
+    finance_text = title + " " + description.lower()
+    for p in ["quant", "trading", "risk", "portfolio", "hedge fund",
+              "bloomberg", "sharpe", "derivatives", "options", "futures"]:
+        if p in finance_text:
+            breakdown["finance_bonus"] = (+10, "✅ Finance/quant domain — your algo trading aligns")
+            score += 10
+            break
+
+    # ── Dimension 8: Remote/hybrid bonus ──
+    loc = (job.get("location", "") or "").lower()
+    if "remote" in loc:
+        breakdown["remote"] = (+5, "✅ Remote role")
+        score += 5
+    elif "hybrid" in (description.lower() if has_desc else ""):
+        breakdown["remote"] = (+3, "✅ Hybrid role")
+        score += 3
+
+    # ── Dimension 9: Salary signal ──
+    sal_min = parse_salary_min(job.get("salary", ""))
+    if sal_min >= 150000:
+        breakdown["salary"] = (+8, f"✅ Salary ${sal_min//1000}K+ — above target")
+        score += 8
+    elif sal_min >= 120000:
+        breakdown["salary"] = (+5, f"✅ Salary ${sal_min//1000}K — meets target")
+        score += 5
+    elif sal_min > 0:
+        breakdown["salary"] = (-10, f"⚠️ Salary ${sal_min//1000}K — below $120K target")
+        score -= 10
+
+    final = min(100, max(0, score))
+    breakdown["_total"] = final
+    return final, breakdown
 
 
 def filter_jobs(raw_jobs: list) -> list:
@@ -600,7 +937,9 @@ def filter_jobs(raw_jobs: list) -> list:
         if is_disqualified(job):       s_disq  += 1; continue
         if not has_target_salary(job): s_sal   += 1; continue
 
-        job["score"] = score_job(job)
+        score, breakdown = score_job(job)
+        job["score"]     = score
+        job["breakdown"] = breakdown
         SEEN_JOB_HASHES.add(h)
         passed.append(job)
 
@@ -629,18 +968,26 @@ def filter_jobs(raw_jobs: list) -> list:
 # ─────────────────────────────────────────────
 
 def send_telegram(text: str) -> bool:
+    """Send to primary chat ID, and optionally to a second chat ID."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
-                  "parse_mode": "HTML", "disable_web_page_preview": True},
-            timeout=20,
-        )
-        return r.ok
-    except Exception as e:
-        print(f"  [Telegram ERROR] {e}"); return False
+
+    success = True
+    for chat_id in filter(None, [TELEGRAM_CHAT_ID, TELEGRAM_CHAT_ID_2]):
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": text,
+                      "parse_mode": "HTML", "disable_web_page_preview": True},
+                timeout=20,
+            )
+            if not r.ok:
+                print(f"  [Telegram ERROR chat {chat_id}] {r.status_code}: {r.text[:100]}")
+                success = False
+        except Exception as e:
+            print(f"  [Telegram ERROR chat {chat_id}] {e}")
+            success = False
+    return success
 
 
 def score_label(s: int) -> str:
@@ -663,18 +1010,44 @@ def send_all_jobs(jobs: list, run_label: str):
         f"All {len(jobs)} match(es) 👇"
     )
 
-    for i in range(0, len(jobs), 5):
+    for i in range(0, len(jobs), 3):
         lines = []
-        for j, job in enumerate(jobs[i:i+5], start=i+1):
-            sal  = job["salary"] if job["salary"] != "Not listed" else "Salary not listed"
-            age  = f" · {job['age_str']}" if job.get("age_str") else ""
-            appl = f" · 👥 {job['applicants']}" if job.get("applicants") else ""
+        for j, job in enumerate(jobs[i:i+3], start=i+1):
+            sal      = job["salary"] if job["salary"] != "Not listed" else "Salary not listed"
+            age      = f" · {job['age_str']}" if job.get("age_str") else ""
+            appl     = f" · 👥 {job['applicants']}" if job.get("applicants") else ""
+            score    = job["score"]
+            bd       = job.get("breakdown", {})
+
+            # Build score breakdown lines
+            bd_lines = []
+            dim_icons = {
+                "role":          "🎯",
+                "experience":    "📅",
+                "education":     "🎓",
+                "skills":        "🛠",
+                "missing_skills":"⚠️",
+                "seniority":     "📊",
+                "industry":      "🏭",
+                "finance_bonus": "📈",
+                "remote":        "🏠",
+                "salary":        "💵",
+            }
+            for dim, icon in dim_icons.items():
+                if dim in bd and dim != "_total":
+                    delta, label = bd[dim]
+                    if label:
+                        sign = f"+{delta}" if delta > 0 else str(delta)
+                        bd_lines.append(f"   {icon} {label} ({sign})")
+
+            breakdown_text = "\n".join(bd_lines[:5])  # show top 5 dimensions
+
             lines.append(
-                f"{j}. {score_label(job['score'])} — <b>{job['title']}</b>\n"
+                f"{j}. {score_label(score)} <b>{score}/100</b> — <b>{job['title']}</b>\n"
                 f"   🏢 {job['company']}  📍 {job['location']}\n"
                 f"   💰 {sal}{age}{appl}  |  {job['_source']}\n"
-                f"   📊 Match: {job['score']}/100\n"
-                f"   🔗 <a href='{job['url']}'>Apply Now →</a>\n"
+                f"{breakdown_text}\n"
+                f"   🔗 <a href='{job['url']}'>Apply →</a>\n"
             )
         send_telegram("\n".join(lines))
 
@@ -729,7 +1102,8 @@ def run_startup_checks() -> bool:
         "💰 <b>Salary:</b> Parsed properly — $120K+ filter active\n"
         "🚫 <b>Clearance filter:</b> 30+ phrases (TS/SCI, polygraph, etc)\n"
         "🚫 <b>Sponsorship filter:</b> 15+ phrases\n\n"
-        "📅 Mon/Wed/Thu: 3h | Tuesday: 2h"
+        "📅 Mon/Wed/Thu: 3h | Tuesday: 2h\n"
+        f"{'✅ Second recipient active' if TELEGRAM_CHAT_ID_2 else '⚪ Add TELEGRAM_CHAT_ID_2 for a second recipient'}"
     )
     if not ok:
         print("  ❌ Telegram failed"); return False

@@ -12,7 +12,7 @@ What's fixed:
     obtain", "polygraph", "TS/SCI" and more edge cases
   ✓ JSearch: kept as optional supplement (set RAPIDAPI_KEY or skip)
 
-pip install requests apscheduler beautifulsoup4 lxml
+pip install requests apscheduler beautifulsoup4
 =============================================================
 """
 
@@ -83,7 +83,7 @@ def fetch_linkedin_detail(job_id: str) -> dict:
         resp = requests.get(url, headers=HEADERS, timeout=10)
         if not resp.ok:
             return {}
-        soup = BeautifulSoup(resp.text, "lxml")
+        soup = BeautifulSoup(resp.text, "html.parser")
 
         # Description
         desc_el = soup.find("div", class_="description__text")
@@ -155,9 +155,15 @@ def scrape_linkedin_role(keyword: str, pages: int = 2) -> list:
             if not resp.ok:
                 break
 
-            soup  = BeautifulSoup(resp.text, "lxml")
-            cards = soup.find_all("div", class_="base-card")
+            soup  = BeautifulSoup(resp.text, "html.parser")
+
+            # Try multiple selectors — LinkedIn occasionally changes class names
+            cards = (soup.find_all("div", class_="base-card") or
+                     soup.find_all("li", class_=re.compile(r"jobs-search-results__list-item")) or
+                     soup.find_all("div", attrs={"data-entity-urn": True}))
+
             if not cards:
+                print(f"    LinkedIn no cards found (status {resp.status_code}, chars {len(resp.text)})")
                 break
 
             for card in cards:
@@ -259,7 +265,7 @@ def scrape_indeed_role(query: str) -> list:
         if not resp.ok:
             return []
 
-        soup = BeautifulSoup(resp.text, "lxml")
+        soup = BeautifulSoup(resp.text, "html.parser")
 
         # Indeed job cards
         cards = soup.find_all("div", class_=re.compile(r"job_seen_beacon|resultContent"))
